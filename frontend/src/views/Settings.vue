@@ -46,23 +46,23 @@
                 />
                 <div class="flex items-center justify-between gap-2 text-xs text-muted-foreground">
                   <span>账户操作代理</span>
-                  <HelpTip text="用于注册/登录/刷新操作的代理，留空则禁用" />
+                  <HelpTip text="用于注册/登录/刷新操作的代理，支持标准地址或 Resin 模板，例如 http://AuthPlatform.{account}:token@resin:2260" />
                 </div>
                 <input
                   v-model="localSettings.basic.proxy_for_auth"
                   type="text"
                   class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
-                  placeholder="http://127.0.0.1:7890 | no_proxy=localhost,127.0.0.1"
+                  placeholder="http://AuthPlatform.{account}:token@resin:2260"
                 />
                 <div class="flex items-center justify-between gap-2 text-xs text-muted-foreground">
                   <span>聊天操作代理</span>
-                  <HelpTip text="用于 JWT/会话/消息操作的代理，留空则禁用" />
+                  <HelpTip text="用于 JWT/会话/消息操作的代理，支持标准地址或 Resin 模板，例如 http://ChatPlatform.{account}:token@resin:2260" />
                 </div>
                 <input
                   v-model="localSettings.basic.proxy_for_chat"
                   type="text"
                   class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
-                  placeholder="http://127.0.0.1:7890 | no_proxy=localhost,127.0.0.1"
+                  placeholder="http://ChatPlatform.{account}:token@resin:2260"
                 />
               </div>
             </div>
@@ -72,6 +72,24 @@
               <div class="mt-4 grid grid-cols-2 gap-3 text-sm">
                 <label class="col-span-2 text-xs text-muted-foreground">账户切换次数</label>
                 <input v-model.number="localSettings.retry.max_account_switch_tries" type="number" min="1" class="col-span-2 rounded-2xl border border-input bg-background px-3 py-2" />
+
+                <div class="col-span-2 flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                  <span>验证码最大尝试次数</span>
+                  <HelpTip text="单个账号获取验证码时的最大尝试次数。每次失败前会请求 Resin 切换一次账户操作代理；达到上限后才会换下一个账号。" />
+                </div>
+                <input v-model.number="localSettings.retry.verification_code_attempts" type="number" min="1" max="10" class="col-span-2 rounded-2xl border border-input bg-background px-3 py-2" />
+
+                <div class="col-span-2 flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                  <span>验证码等待超时（秒）</span>
+                  <HelpTip text="单次等待验证码的总时长。超时后会按重发次数继续重发；如果整轮失败，会进入下一次验证码尝试并切换账户代理。" />
+                </div>
+                <input v-model.number="localSettings.retry.verification_code_timeout_seconds" type="number" min="5" max="180" class="col-span-2 rounded-2xl border border-input bg-background px-3 py-2" />
+
+                <div class="col-span-2 flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                  <span>验证码轮询间隔（秒）</span>
+                  <HelpTip text="轮询临时邮箱检查验证码的时间间隔。值越小响应越快，但请求也会更频繁。" />
+                </div>
+                <input v-model.number="localSettings.retry.verification_code_poll_interval_seconds" type="number" min="1" max="30" class="col-span-2 rounded-2xl border border-input bg-background px-3 py-2" />
 
                 <label class="col-span-2 text-xs text-muted-foreground">对话冷却（小时）</label>
                 <input v-model.number="textRateLimitCooldownHours" type="number" min="1" max="24" step="1" class="col-span-2 rounded-2xl border border-input bg-background px-3 py-2" />
@@ -566,6 +584,18 @@ watch(settings, (value) => {
     ? next.basic.cfmail_domain
     : ''
   next.retry = next.retry || {}
+  next.retry.verification_code_attempts = Number.isFinite(next.retry.verification_code_attempts)
+    ? next.retry.verification_code_attempts
+    : 3
+  next.retry.verification_code_timeout_seconds = Number.isFinite(next.retry.verification_code_timeout_seconds)
+    ? next.retry.verification_code_timeout_seconds
+    : 25
+  next.retry.verification_code_poll_interval_seconds = Number.isFinite(next.retry.verification_code_poll_interval_seconds)
+    ? next.retry.verification_code_poll_interval_seconds
+    : 5
+  next.retry.verification_code_resend_count = Number.isFinite(next.retry.verification_code_resend_count)
+    ? next.retry.verification_code_resend_count
+    : 2
   next.retry.auto_refresh_accounts_seconds = Number.isFinite(next.retry.auto_refresh_accounts_seconds)
     ? next.retry.auto_refresh_accounts_seconds
     : 60

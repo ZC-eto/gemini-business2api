@@ -326,16 +326,22 @@ class GeminiAutomation:
             self._save_screenshot(page, "code_input_missing")
             return {"success": False, "error": "code input not found"}
 
-        # Step 5: 轮询邮件获取验证码（3次，每次5秒间隔）
+        # Step 5: 轮询邮件获取验证码
         self._log("info", "📬 等待邮箱验证码...")
         poll_since_time = task_start_time - timedelta(seconds=30)
-        first_timeout = 30 if self._last_send_confidence == "confirmed" else 20
-        self._log("info", f"📬 等待邮箱验证码 (窗口 {first_timeout}s, 发送状态={self._last_send_confidence})")
-        code = mail_client.poll_for_code(timeout=first_timeout, interval=5, since_time=poll_since_time)
+        from core.config import config
+
+        verification_timeout = int(getattr(config.retry, "verification_code_timeout_seconds", 25) or 25)
+        verification_timeout = max(5, min(180, verification_timeout))
+        poll_interval = int(getattr(config.retry, "verification_code_poll_interval_seconds", 5) or 5)
+        poll_interval = max(1, min(30, poll_interval))
+        self._log(
+            "info",
+            f"📬 等待邮箱验证码 (窗口 {verification_timeout}s, 轮询 {poll_interval}s, 发送状态={self._last_send_confidence})",
+        )
+        code = mail_client.poll_for_code(timeout=verification_timeout, interval=poll_interval, since_time=poll_since_time)
 
         if not code:
-            from core.config import config
-
             resend_attempts = int(getattr(config.retry, "verification_code_resend_count", 2) or 0)
             resend_attempts = max(0, min(5, resend_attempts))
             if resend_attempts <= 0:
@@ -351,9 +357,11 @@ class GeminiAutomation:
                     self._log("warning", f"⚠️ 未找到重发按钮 ({resend_index}/{resend_attempts})")
                     continue
 
-                resend_timeout = 25 if self._last_send_confidence == "confirmed" else 15
-                self._log("info", f"📬 已执行重发，继续轮询 (窗口 {resend_timeout}s, 发送状态={self._last_send_confidence}, 第 {resend_index} 次重发)")
-                code = mail_client.poll_for_code(timeout=resend_timeout, interval=5, since_time=poll_since_time)
+                self._log(
+                    "info",
+                    f"📬 已执行重发，继续轮询 (窗口 {verification_timeout}s, 轮询 {poll_interval}s, 发送状态={self._last_send_confidence}, 第 {resend_index} 次重发)",
+                )
+                code = mail_client.poll_for_code(timeout=verification_timeout, interval=poll_interval, since_time=poll_since_time)
                 if code:
                     break
 

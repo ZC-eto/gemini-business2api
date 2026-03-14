@@ -122,6 +122,9 @@ class RetryConfig(BaseModel):
     refresh_batch_size: int = Field(default=0, ge=0, le=1000, description="(已弃用) 批次刷新账号数")
     refresh_batch_interval_minutes: int = Field(default=0, ge=0, le=1440, description="(已弃用) 批次间等待时间(分钟)")
     refresh_cooldown_hours: float = Field(default=12.0, ge=1, le=48, description="同一账号刷新冷却期(小时)")
+    verification_code_attempts: int = Field(default=3, ge=1, le=10, description="单个账号获取验证码的最大尝试次数（每次失败前会请求切换一次账户代理）")
+    verification_code_timeout_seconds: int = Field(default=25, ge=5, le=180, description="单次验证码等待超时（秒）")
+    verification_code_poll_interval_seconds: int = Field(default=5, ge=1, le=30, description="验证码轮询间隔（秒）")
     verification_code_resend_count: int = Field(default=2, ge=0, le=5, description="验证码超时后的重发次数")
     # 向后兼容：旧配置可能只有这个字段，读取时自动转换为 */N cron 格式
     scheduled_refresh_interval_minutes: int = Field(default=0, ge=0, le=720, description="(旧字段，已废弃) 定时刷新检测间隔")

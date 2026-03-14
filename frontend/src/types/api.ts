@@ -126,6 +126,9 @@ export interface Settings {
     scheduled_refresh_interval_minutes?: number
     scheduled_refresh_cron?: string
     refresh_cooldown_hours?: number
+    verification_code_attempts?: number
+    verification_code_timeout_seconds?: number
+    verification_code_poll_interval_seconds?: number
     verification_code_resend_count?: number
   }
   public_display: {

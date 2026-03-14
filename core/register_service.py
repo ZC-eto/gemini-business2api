@@ -11,9 +11,21 @@ from core.base_task_service import BaseTask, BaseTaskService, TaskCancelledError
 from core.config import config
 from core.mail_providers import create_temp_mail_client
 from core.gemini_automation import GeminiAutomation
-from core.proxy_utils import parse_proxy_setting
+from core.proxy_utils import resolve_proxy_setting, rotate_resin_proxy_sync
 
 logger = logging.getLogger("gemini.register")
+
+
+def _should_rotate_auth_proxy(error_message: str) -> bool:
+    error_text = (error_message or "").strip().lower()
+    if not error_text:
+        return False
+    rotate_markers = (
+        "send code failed",
+        "verification code timeout",
+        "verification code timeout after resend retries",
+    )
+    return any(marker in error_text for marker in rotate_markers)
 
 
 @dataclass
@@ -164,9 +176,14 @@ class RegisterService(BaseTaskService[RegisterTask]):
             log_cb("error", "❌ Freemail JWT Token 未配置")
             return {"success": False, "error": "Freemail JWT Token 未配置"}
 
+        mail_proxy, _ = resolve_proxy_setting(
+            config.basic.proxy_for_auth,
+            default_account="register",
+        )
         client = create_temp_mail_client(
             temp_mail_provider,
             domain=domain,
+            proxy=mail_proxy if config.basic.mail_proxy_enabled else "",
             log_cb=log_cb,
         )
 
@@ -178,28 +195,51 @@ class RegisterService(BaseTaskService[RegisterTask]):
 
         browser_mode = (config.basic.browser_mode or "normal").strip().lower()
         headless = config.basic.browser_headless
-        proxy_for_auth, _ = parse_proxy_setting(config.basic.proxy_for_auth)
+        proxy_source = config.basic.proxy_for_auth
+        proxy_for_auth, _ = resolve_proxy_setting(
+            proxy_source,
+            account_id=client.email,
+            email=client.email,
+        )
 
         log_cb("info", f"🌐 步骤 2/3: 启动浏览器 (模式={browser_mode}, 无头={headless})...")
 
-        automation = GeminiAutomation(
-            user_agent=self.user_agent,
-            proxy=proxy_for_auth,
-            browser_mode=browser_mode,
-            log_callback=log_cb,
-        )
-        # 允许外部取消时立刻关闭浏览器
-        self._add_cancel_hook(task.id, lambda: getattr(automation, "stop", lambda: None)())
+        configured_auth_attempts = int(getattr(config.retry, "verification_code_attempts", 3) or 1)
+        configured_auth_attempts = max(1, min(10, configured_auth_attempts))
+        max_auth_attempts = configured_auth_attempts if proxy_source else 1
+        result = None
+        for auth_attempt in range(1, max_auth_attempts + 1):
+            automation = GeminiAutomation(
+                user_agent=self.user_agent,
+                proxy=proxy_for_auth,
+                browser_mode=browser_mode,
+                log_callback=log_cb,
+            )
+            # 允许外部取消时立刻关闭浏览器
+            self._add_cancel_hook(task.id, lambda: getattr(automation, "stop", lambda: None)())
 
-        try:
-            log_cb("info", "🔐 步骤 3/3: 执行 Gemini 自动登录...")
-            result = automation.login_and_extract(client.email, client, is_new_account=True)
-        except Exception as exc:
-            log_cb("error", f"❌ 自动登录异常: {exc}")
-            return {"success": False, "error": str(exc)}
+            try:
+                log_cb("info", f"🔐 步骤 3/3: 执行 Gemini 自动登录... (尝试 {auth_attempt}/{max_auth_attempts})")
+                result = automation.login_and_extract(client.email, client, is_new_account=True)
+            except Exception as exc:
+                result = {"success": False, "error": str(exc)}
+                log_cb("error", f"❌ 自动登录异常: {exc}")
 
-        if not result.get("success"):
+            if result.get("success"):
+                break
+
             error = result.get("error", "自动化流程失败")
+            if auth_attempt < max_auth_attempts and _should_rotate_auth_proxy(error):
+                rotated = rotate_resin_proxy_sync(
+                    proxy_source,
+                    account_id=client.email,
+                    email=client.email,
+                    log_callback=log_cb,
+                )
+                if rotated:
+                    log_cb("warning", "♻️ 注册验证码链路疑似被风控，已请求 Resin 切换账户代理并重试")
+                    continue
+
             log_cb("error", f"❌ 自动登录失败: {error}")
             return {"success": False, "error": error}
 
