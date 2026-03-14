@@ -66,7 +66,7 @@ from core.account import (
     bulk_update_account_disabled_status as _bulk_update_account_disabled_status,
     bulk_delete_accounts as _bulk_delete_accounts
 )
-from core.proxy_utils import parse_proxy_setting
+from core.proxy_utils import ProxyTemplateAsyncClient, parse_proxy_setting, proxy_runtime_context
 
 # 导入 Uptime 追踪器
 from core import uptime as uptime_tracker
@@ -350,8 +350,10 @@ logger.addHandler(memory_handler)
 TIMEOUT_SECONDS = 300
 API_KEY = config.basic.api_key
 ADMIN_KEY = config.security.admin_key
-_proxy_auth, _no_proxy_auth = parse_proxy_setting(config.basic.proxy_for_auth)
-_proxy_chat, _no_proxy_chat = parse_proxy_setting(config.basic.proxy_for_chat)
+PROXY_FOR_AUTH_TEMPLATE = config.basic.proxy_for_auth
+PROXY_FOR_CHAT_TEMPLATE = config.basic.proxy_for_chat
+_proxy_auth, _no_proxy_auth = parse_proxy_setting(PROXY_FOR_AUTH_TEMPLATE)
+_proxy_chat, _no_proxy_chat = parse_proxy_setting(PROXY_FOR_CHAT_TEMPLATE)
 PROXY_FOR_AUTH = _proxy_auth
 PROXY_FOR_CHAT = _proxy_chat
 _NO_PROXY = ",".join(filter(None, {_no_proxy_auth, _no_proxy_chat}))
@@ -438,45 +440,44 @@ MODEL_MAPPING = {
 }
 
 # ---------- HTTP 客户端 ----------
-# 对话操作客户端（用于JWT获取、创建会话、发送消息）
-http_client = httpx.AsyncClient(
-    proxy=(PROXY_FOR_CHAT or None),
-    verify=False,
-    http2=False,
-    timeout=httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
-    limits=httpx.Limits(
-        max_keepalive_connections=100,
-        max_connections=200
+def _build_http_client_kwargs() -> dict:
+    return {
+        "verify": False,
+        "http2": False,
+        "timeout": httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
+        "limits": httpx.Limits(
+            max_keepalive_connections=100,
+            max_connections=200,
+        ),
+    }
+
+
+def _build_chat_http_client() -> ProxyTemplateAsyncClient:
+    return ProxyTemplateAsyncClient(
+        lambda: PROXY_FOR_CHAT_TEMPLATE,
+        **_build_http_client_kwargs(),
     )
-)
+
+
+def _build_auth_http_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        proxy=(PROXY_FOR_AUTH or None),
+        **_build_http_client_kwargs(),
+    )
+
+
+# 对话操作客户端（用于JWT获取、创建会话、发送消息）
+http_client = _build_chat_http_client()
 
 # 对话流式客户端（用于流式响应）
-http_client_chat = httpx.AsyncClient(
-    proxy=(PROXY_FOR_CHAT or None),
-    verify=False,
-    http2=False,
-    timeout=httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
-    limits=httpx.Limits(
-        max_keepalive_connections=100,
-        max_connections=200
-    )
-)
+http_client_chat = _build_chat_http_client()
 
 # 账户操作客户端（用于注册/登录/刷新）
-http_client_auth = httpx.AsyncClient(
-    proxy=(PROXY_FOR_AUTH or None),
-    verify=False,
-    http2=False,
-    timeout=httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
-    limits=httpx.Limits(
-        max_keepalive_connections=100,
-        max_connections=200
-    )
-)
+http_client_auth = _build_auth_http_client()
 
 # 打印代理配置日志
-logger.info(f"[PROXY] Account operations (register/login/refresh): {PROXY_FOR_AUTH if PROXY_FOR_AUTH else 'disabled'}")
-logger.info(f"[PROXY] Chat operations (JWT/session/messages): {PROXY_FOR_CHAT if PROXY_FOR_CHAT else 'disabled'}")
+logger.info(f"[PROXY] Account operations (register/login/refresh): {PROXY_FOR_AUTH_TEMPLATE or 'disabled'}")
+logger.info(f"[PROXY] Chat operations (JWT/session/messages): {PROXY_FOR_CHAT_TEMPLATE or 'disabled'}")
 
 # ---------- 工具函数 ----------
 def _parse_bool(value, default: bool) -> bool:
@@ -1714,6 +1715,9 @@ async def admin_get_settings(request: Request):
             "scheduled_refresh_enabled": config.retry.scheduled_refresh_enabled,
             "scheduled_refresh_cron": config.retry.scheduled_refresh_cron,
             "refresh_cooldown_hours": config.retry.refresh_cooldown_hours,
+            "verification_code_attempts": config.retry.verification_code_attempts,
+            "verification_code_timeout_seconds": config.retry.verification_code_timeout_seconds,
+            "verification_code_poll_interval_seconds": config.retry.verification_code_poll_interval_seconds,
             "verification_code_resend_count": config.retry.verification_code_resend_count,
         },
         "quota_limits": {
@@ -1736,6 +1740,7 @@ async def admin_get_settings(request: Request):
 async def admin_update_settings(request: Request, new_settings: dict = Body(...)):
     """更新系统设置"""
     global API_KEY, PROXY_FOR_AUTH, PROXY_FOR_CHAT, BASE_URL, LOGO_URL, CHAT_URL
+    global PROXY_FOR_AUTH_TEMPLATE, PROXY_FOR_CHAT_TEMPLATE
     global IMAGE_GENERATION_ENABLED, IMAGE_GENERATION_MODELS
     global MAX_ACCOUNT_SWITCH_TRIES
     global RETRY_POLICY
@@ -1811,6 +1816,9 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
         retry.setdefault("text_rate_limit_cooldown_seconds", config.retry.text_rate_limit_cooldown_seconds)
         retry.setdefault("images_rate_limit_cooldown_seconds", config.retry.images_rate_limit_cooldown_seconds)
         retry.setdefault("videos_rate_limit_cooldown_seconds", config.retry.videos_rate_limit_cooldown_seconds)
+        retry.setdefault("verification_code_attempts", config.retry.verification_code_attempts)
+        retry.setdefault("verification_code_timeout_seconds", config.retry.verification_code_timeout_seconds)
+        retry.setdefault("verification_code_poll_interval_seconds", config.retry.verification_code_poll_interval_seconds)
         retry.setdefault("verification_code_resend_count", config.retry.verification_code_resend_count)
         new_settings["retry"] = retry
 
@@ -1823,8 +1831,8 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
         new_settings["quota_limits"] = quota_limits
 
         # 保存旧配置用于对比
-        old_proxy_for_auth = PROXY_FOR_AUTH
-        old_proxy_for_chat = PROXY_FOR_CHAT
+        old_proxy_for_auth = PROXY_FOR_AUTH_TEMPLATE
+        old_proxy_for_chat = PROXY_FOR_CHAT_TEMPLATE
         old_retry_config = {
             "text_rate_limit_cooldown_seconds": RETRY_POLICY.cooldowns.text,
             "images_rate_limit_cooldown_seconds": RETRY_POLICY.cooldowns.images,
@@ -1840,8 +1848,10 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
 
         # 更新全局变量（实时生效）
         API_KEY = config.basic.api_key
-        _proxy_auth, _no_proxy_auth = parse_proxy_setting(config.basic.proxy_for_auth)
-        _proxy_chat, _no_proxy_chat = parse_proxy_setting(config.basic.proxy_for_chat)
+        PROXY_FOR_AUTH_TEMPLATE = config.basic.proxy_for_auth
+        PROXY_FOR_CHAT_TEMPLATE = config.basic.proxy_for_chat
+        _proxy_auth, _no_proxy_auth = parse_proxy_setting(PROXY_FOR_AUTH_TEMPLATE)
+        _proxy_chat, _no_proxy_chat = parse_proxy_setting(PROXY_FOR_CHAT_TEMPLATE)
         PROXY_FOR_AUTH = _proxy_auth
         PROXY_FOR_CHAT = _proxy_chat
         _NO_PROXY = ",".join(filter(None, {_no_proxy_auth, _no_proxy_chat}))
@@ -1861,51 +1871,24 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
         SESSION_EXPIRE_HOURS = config.session.expire_hours
 
         # 检查是否需要重建 HTTP 客户端（代理变化）
-        if old_proxy_for_auth != PROXY_FOR_AUTH or old_proxy_for_chat != PROXY_FOR_CHAT:
+        if old_proxy_for_auth != PROXY_FOR_AUTH_TEMPLATE or old_proxy_for_chat != PROXY_FOR_CHAT_TEMPLATE:
             logger.info(f"[CONFIG] Proxy configuration changed, rebuilding HTTP clients")
             await http_client.aclose()
             await http_client_chat.aclose()
             await http_client_auth.aclose()
 
             # 重新创建对话客户端
-            http_client = httpx.AsyncClient(
-                proxy=(PROXY_FOR_CHAT or None),
-                verify=False,
-                http2=False,
-                timeout=httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
-                limits=httpx.Limits(
-                    max_keepalive_connections=100,
-                    max_connections=200
-                )
-            )
+            http_client = _build_chat_http_client()
 
             # 重新创建对话流式客户端
-            http_client_chat = httpx.AsyncClient(
-                proxy=(PROXY_FOR_CHAT or None),
-                verify=False,
-                http2=False,
-                timeout=httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
-                limits=httpx.Limits(
-                    max_keepalive_connections=100,
-                    max_connections=200
-                )
-            )
+            http_client_chat = _build_chat_http_client()
 
             # 重新创建账户操作客户端
-            http_client_auth = httpx.AsyncClient(
-                proxy=(PROXY_FOR_AUTH or None),
-                verify=False,
-                http2=False,
-                timeout=httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
-                limits=httpx.Limits(
-                    max_keepalive_connections=100,
-                    max_connections=200
-                )
-            )
+            http_client_auth = _build_auth_http_client()
 
             # 打印新的代理配置
-            logger.info(f"[PROXY] Account operations (register/login/refresh): {PROXY_FOR_AUTH if PROXY_FOR_AUTH else 'disabled'}")
-            logger.info(f"[PROXY] Chat operations (JWT/session/messages): {PROXY_FOR_CHAT if PROXY_FOR_CHAT else 'disabled'}")
+            logger.info(f"[PROXY] Account operations (register/login/refresh): {PROXY_FOR_AUTH_TEMPLATE or 'disabled'}")
+            logger.info(f"[PROXY] Chat operations (JWT/session/messages): {PROXY_FOR_CHAT_TEMPLATE or 'disabled'}")
 
             # 更新所有账户的 http_client 引用（对话用）
             multi_account_mgr.update_http_client(http_client)
@@ -2273,7 +2256,11 @@ async def chat_impl(
             for retry_idx in range(max_retries):
                 try:
                     account_manager = await multi_account_mgr.get_account(None, request_id, required_quota_types)
-                    google_session = await create_google_session(account_manager, http_client, USER_AGENT, request_id)
+                    with proxy_runtime_context(
+                        account_id=account_manager.config.account_id,
+                        email=account_manager.config.mail_address or account_manager.config.account_id,
+                    ):
+                        google_session = await create_google_session(account_manager, http_client, USER_AGENT, request_id)
                     # 线程安全地绑定账户到此对话
                     await multi_account_mgr.set_session_cache(
                         conv_key,
@@ -2334,7 +2321,11 @@ async def chat_impl(
 
     # 3. 解析请求内容
     try:
-        last_text, current_images = await parse_last_message(req.messages, http_client, request_id)
+        with proxy_runtime_context(
+            account_id=account_manager.config.account_id,
+            email=account_manager.config.mail_address or account_manager.config.account_id,
+        ):
+            last_text, current_images = await parse_last_message(req.messages, http_client, request_id)
     except HTTPException as e:
         status = classify_error_status(e.status_code, e)
         await finalize_result(status, e.status_code, f"HTTP {e.status_code}: {e.detail}")
@@ -2373,46 +2364,50 @@ async def chat_impl(
 
         for retry_idx in range(max_retries):
             try:
-                # 获取或创建 Session
-                cached = multi_account_mgr.global_session_cache.get(conv_key)
-                if not cached:
-                    logger.warning(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] 缓存已清理，重建Session")
-                    new_sess = await create_google_session(account_manager, http_client, USER_AGENT, request_id)
-                    await multi_account_mgr.set_session_cache(
-                        conv_key,
-                        account_manager.config.account_id,
-                        new_sess
-                    )
-                    current_session = new_sess
-                    current_retry_mode = True
-                    current_file_ids = []
-                else:
-                    current_session = cached["session_id"]
-
-                # 上传图片（如果需要）
-                if current_images and not current_file_ids:
-                    for img in current_images:
-                        fid = await upload_context_file(current_session, img["mime"], img["data"], account_manager, http_client, USER_AGENT, request_id)
-                        current_file_ids.append(fid)
-
-                # 准备文本（重试模式下发全文）
-                if current_retry_mode:
-                    current_text = build_full_context_text(req.messages)
-
-                # 发起对话
-                async for chunk in stream_chat_generator(
-                    current_session,
-                    current_text,
-                    current_file_ids,
-                    req.model,
-                    chat_id,
-                    created_time,
-                    account_manager,
-                    req.stream,
-                    request_id,
-                    request
+                with proxy_runtime_context(
+                    account_id=account_manager.config.account_id,
+                    email=account_manager.config.mail_address or account_manager.config.account_id,
                 ):
-                    yield chunk
+                    # 获取或创建 Session
+                    cached = multi_account_mgr.global_session_cache.get(conv_key)
+                    if not cached:
+                        logger.warning(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] 缓存已清理，重建Session")
+                        new_sess = await create_google_session(account_manager, http_client, USER_AGENT, request_id)
+                        await multi_account_mgr.set_session_cache(
+                            conv_key,
+                            account_manager.config.account_id,
+                            new_sess
+                        )
+                        current_session = new_sess
+                        current_retry_mode = True
+                        current_file_ids = []
+                    else:
+                        current_session = cached["session_id"]
+
+                    # 上传图片（如果需要）
+                    if current_images and not current_file_ids:
+                        for img in current_images:
+                            fid = await upload_context_file(current_session, img["mime"], img["data"], account_manager, http_client, USER_AGENT, request_id)
+                            current_file_ids.append(fid)
+
+                    # 准备文本（重试模式下发全文）
+                    if current_retry_mode:
+                        current_text = build_full_context_text(req.messages)
+
+                    # 发起对话
+                    async for chunk in stream_chat_generator(
+                        current_session,
+                        current_text,
+                        current_file_ids,
+                        req.model,
+                        chat_id,
+                        created_time,
+                        account_manager,
+                        req.stream,
+                        request_id,
+                        request
+                    ):
+                        yield chunk
 
                 if getattr(request.state, "first_response_time", None) is None:
                     # 空响应应该触发重试逻辑
@@ -2459,7 +2454,11 @@ async def chat_impl(
                         logger.info(f"[CHAT] [req_{request_id}] 切换账户: {account_manager.config.account_id} -> {new_account.config.account_id}")
 
                         # 创建新 Session
-                        new_sess = await create_google_session(new_account, http_client, USER_AGENT, request_id)
+                        with proxy_runtime_context(
+                            account_id=new_account.config.account_id,
+                            email=new_account.config.mail_address or new_account.config.account_id,
+                        ):
+                            new_sess = await create_google_session(new_account, http_client, USER_AGENT, request_id)
 
                         # 更新缓存绑定到新账户
                         await multi_account_mgr.set_session_cache(
@@ -2598,7 +2597,10 @@ async def generate_images(
             if not data_list and url_matches:
                 for url in url_matches[:req.n]:
                     try:
-                        resp = await http_client.get(url)
+                        with proxy_runtime_context(
+                            account_id=getattr(request.state, "last_account_id", "") or "shared",
+                        ):
+                            resp = await http_client.get(url)
                         if resp.status_code == 200:
                             b64_data = base64.b64encode(resp.content).decode()
                             data_list.append({"b64_json": b64_data, "revised_prompt": req.prompt})
@@ -2719,7 +2721,10 @@ async def edit_images(
             if not data_list and url_matches:
                 for url in url_matches[:n]:
                     try:
-                        resp = await http_client.get(url)
+                        with proxy_runtime_context(
+                            account_id=getattr(request.state, "last_account_id", "") or "shared",
+                        ):
+                            resp = await http_client.get(url)
                         if resp.status_code == 200:
                             b64_data = base64.b64encode(resp.content).decode()
                             data_list.append({"b64_json": b64_data, "revised_prompt": prompt})

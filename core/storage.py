@@ -313,6 +313,38 @@ async def _init_tables(pool) -> None:
             ON task_history(created_at DESC)
             """
         )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS request_logs (
+                id BIGSERIAL PRIMARY KEY,
+                timestamp BIGINT NOT NULL,
+                model TEXT NOT NULL,
+                ttfb_ms INTEGER,
+                total_ms INTEGER,
+                status TEXT NOT NULL,
+                status_code INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS request_logs_timestamp_idx
+            ON request_logs(timestamp)
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS request_logs_model_idx
+            ON request_logs(model)
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS request_logs_status_idx
+            ON request_logs(status)
+            """
+        )
         logger.info("[STORAGE] Database tables initialized")
 
 def _init_sqlite_tables(conn: sqlite3.Connection) -> None:
