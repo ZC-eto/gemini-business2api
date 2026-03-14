@@ -48,13 +48,23 @@ def _normalize_browser_mode(value, default: str = "normal") -> str:
     return default
 
 
+def _normalize_proxy_type(value, default: str = "auto") -> str:
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("auto", "standard", "resin"):
+            return lowered
+    return default
+
+
 # ==================== 配置模型定义 ====================
 
 class BasicConfig(BaseModel):
     """基础配置"""
     api_key: str = Field(default="", description="API访问密钥（留空则公开访问，多个密钥用逗号分隔）")
     base_url: str = Field(default="", description="服务器URL（留空则自动检测）")
+    proxy_for_auth_type: str = Field(default="auto", description="账户操作代理类型：auto/standard/resin")
     proxy_for_auth: str = Field(default="", description="账户操作代理地址（注册/登录/刷新，留空则不使用代理）")
+    proxy_for_chat_type: str = Field(default="auto", description="聊天操作代理类型：auto/standard/resin")
     proxy_for_chat: str = Field(default="", description="对话操作代理地址（JWT/会话/消息，留空则不使用代理）")
     duckmail_base_url: str = Field(default="https://api.duckmail.sbs", description="DuckMail API地址")
     duckmail_api_key: str = Field(default="", description="DuckMail API key")
@@ -254,6 +264,8 @@ class ConfigManager:
         # 新配置优先，如果没有新配置则从旧配置迁移
         proxy_for_auth = basic_data.get("proxy_for_auth", "")
         proxy_for_chat = basic_data.get("proxy_for_chat", "")
+        proxy_for_auth_type = _normalize_proxy_type(basic_data.get("proxy_for_auth_type"), "auto")
+        proxy_for_chat_type = _normalize_proxy_type(basic_data.get("proxy_for_chat_type"), "auto")
 
         # 如果新配置为空且存在旧配置，则迁移
         if not proxy_for_auth and old_proxy:
@@ -273,7 +285,9 @@ class ConfigManager:
         basic_config = BasicConfig(
             api_key=basic_data.get("api_key") or "",
             base_url=basic_data.get("base_url") or "",
+            proxy_for_auth_type=proxy_for_auth_type,
             proxy_for_auth=str(proxy_for_auth or "").strip(),
+            proxy_for_chat_type=proxy_for_chat_type,
             proxy_for_chat=str(proxy_for_chat or "").strip(),
             duckmail_base_url=basic_data.get("duckmail_base_url") or "https://api.duckmail.sbs",
             duckmail_api_key=str(duckmail_api_key_raw or "").strip(),

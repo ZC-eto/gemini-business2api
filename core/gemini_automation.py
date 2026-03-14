@@ -5,6 +5,7 @@ import os
 import json
 import random
 import re
+import shutil
 import string
 import time
 from datetime import datetime, timedelta, timezone
@@ -13,18 +14,11 @@ from urllib.parse import quote
 
 from DrissionPage import ChromiumPage, ChromiumOptions
 from core.base_task_service import TaskCancelledError
+from core.proxy_utils import cleanup_temp_dir, find_chromium_path, prepare_chromium_proxy
 
 
 # 常量
 AUTH_HOME_URL = "https://auth.business.gemini.google/login"
-
-# Linux 下常见的 Chromium 路径
-CHROMIUM_PATHS = [
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/usr/bin/google-chrome",
-    "/usr/bin/google-chrome-stable",
-]
 
 # 注册时随机使用的真实英文姓名（避免明显的机器人特征）
 REGISTER_NAMES = [
@@ -45,15 +39,6 @@ COMMON_VIEWPORTS = [
 BROWSER_MODE_NORMAL = "normal"
 BROWSER_MODE_SILENT = "silent"
 BROWSER_MODE_HEADLESS = "headless"
-
-
-def _find_chromium_path() -> Optional[str]:
-    """查找可用的 Chromium/Chrome 浏览器路径"""
-    for path in CHROMIUM_PATHS:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            return path
-    return None
-
 
 def _normalize_browser_mode(mode: str, default: str = BROWSER_MODE_NORMAL) -> str:
     value = (mode or "").strip().lower()
@@ -83,6 +68,7 @@ class GeminiAutomation:
         self.log_callback = log_callback
         self._page = None
         self._user_data_dir = None
+        self._proxy_extension_dir = None
         self._last_send_error = ""
         self._last_send_confidence = "unknown"
 
@@ -119,13 +105,15 @@ class GeminiAutomation:
             self._page = None
             self._cleanup_user_data(user_data_dir)
             self._user_data_dir = None
+            cleanup_temp_dir(self._proxy_extension_dir)
+            self._proxy_extension_dir = None
 
     def _create_page(self) -> ChromiumPage:
         """创建浏览器页面"""
         options = ChromiumOptions()
 
         # 自动检测 Chromium 浏览器路径（Linux/Docker 环境）
-        chromium_path = _find_chromium_path()
+        chromium_path = find_chromium_path()
         if chromium_path:
             options.set_browser_path(chromium_path)
 
@@ -152,7 +140,16 @@ class GeminiAutomation:
         options.set_pref("intl.accept_languages", "zh-CN,zh")
 
         if self.proxy:
-            options.set_argument(f"--proxy-server={self.proxy}")
+            proxy_config = prepare_chromium_proxy(self.proxy)
+            self._proxy_extension_dir = proxy_config["extension_dir"]
+            for warning in proxy_config["warnings"]:
+                self._log("warning", f"⚠️ {warning}")
+            if proxy_config["apply_via_argument"]:
+                options.set_argument("--proxy-server", proxy_config["browser_proxy_url"])
+            else:
+                options.set_proxy(proxy_config["browser_proxy_url"])
+            if self._proxy_extension_dir:
+                options.add_extension(self._proxy_extension_dir)
 
         if self.browser_mode == BROWSER_MODE_HEADLESS:
             # 使用新版无头模式，更接近真实浏览器
@@ -1204,7 +1201,6 @@ class GeminiAutomation:
         if not user_data_dir:
             return
         try:
-            import shutil
             if os.path.exists(user_data_dir):
                 shutil.rmtree(user_data_dir, ignore_errors=True)
         except Exception:

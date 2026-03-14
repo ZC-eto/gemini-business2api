@@ -14,10 +14,15 @@ NO_PROXY 格式:
 
 import contextvars
 import functools
+import json
+import os
 import re
+import shutil
+import tempfile
 import threading
 from contextlib import contextmanager
-from typing import Tuple, Callable, Any, Optional, Dict
+from pathlib import Path
+from typing import Tuple, Callable, Any, Optional, Dict, List
 from urllib.parse import quote, unquote, urlparse
 
 import httpx
@@ -26,6 +31,19 @@ import requests
 _RUNTIME_PROXY_CONTEXT: contextvars.ContextVar[Dict[str, str]] = contextvars.ContextVar(
     "runtime_proxy_context",
     default={},
+)
+
+_PROXY_GEO_ENDPOINTS = (
+    "https://api.ip.sb/geoip",
+    "https://ipapi.co/json/",
+    "https://ipinfo.io/json",
+)
+
+_CHROMIUM_PATHS = (
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
 )
 
 
@@ -330,6 +348,416 @@ def parse_resin_proxy_action(proxy_url: str) -> Optional[Dict[str, str]]:
         "account": account,
         "token": token,
     }
+
+
+def parse_proxy_components(proxy_url: str) -> Optional[Dict[str, Any]]:
+    """解析标准代理 URL 的组成部分。"""
+    if not proxy_url:
+        return None
+
+    normalized = normalize_proxy_url(proxy_url)
+    parsed = urlparse(normalized)
+    if not parsed.scheme or not parsed.hostname:
+        return None
+
+    port = parsed.port
+    if port is None:
+        if parsed.scheme == "https":
+            port = 443
+        elif parsed.scheme in ("socks5", "socks5h"):
+            port = 1080
+        else:
+            port = 80
+
+    return {
+        "scheme": parsed.scheme.lower(),
+        "host": parsed.hostname,
+        "port": int(port),
+        "username": unquote(parsed.username or ""),
+        "password": unquote(parsed.password or ""),
+        "url": normalized,
+    }
+
+
+def mask_proxy_url(proxy_url: str) -> str:
+    """对代理 URL 中的敏感信息做脱敏。"""
+    components = parse_proxy_components(proxy_url)
+    if not components:
+        return proxy_url or ""
+
+    auth = ""
+    if components["username"]:
+        auth = quote(components["username"], safe="")
+        if components["password"]:
+            auth = f"{auth}:***"
+        auth = f"{auth}@"
+
+    return f"{components['scheme']}://{auth}{components['host']}:{components['port']}"
+
+
+def find_chromium_path() -> Optional[str]:
+    """查找 Linux/Docker 环境中的 Chromium 可执行文件。"""
+    for path in _CHROMIUM_PATHS:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def prepare_chromium_proxy(proxy_url: str) -> Dict[str, Any]:
+    """
+    将代理 URL 转换为 Chromium 可用配置。
+
+    返回：
+    - browser_proxy_url: 传给 --proxy-server 的地址
+    - extension_dir: 如需处理 HTTP 代理认证，则返回临时扩展目录
+    - warnings: 浏览器代理层的提示信息
+    """
+    components = parse_proxy_components(proxy_url)
+    if not components:
+        return {
+            "browser_proxy_url": proxy_url,
+            "extension_dir": None,
+            "apply_via_argument": True,
+            "warnings": ["代理地址无法解析，浏览器可能无法使用该配置。"],
+        }
+
+    scheme = components["scheme"]
+    host = components["host"]
+    port = components["port"]
+    username = components["username"]
+    password = components["password"]
+    warnings: List[str] = []
+
+    if username or password:
+        if scheme not in ("http", "https"):
+            return {
+                "browser_proxy_url": f"{scheme}://{host}:{port}",
+                "extension_dir": None,
+                "apply_via_argument": True,
+                "warnings": [
+                    "当前代理包含认证信息，但浏览器层仅为 HTTP/HTTPS 代理自动注入认证；该代理类型可能无法用于浏览器自动化。"
+                ],
+            }
+
+        extension_dir = tempfile.mkdtemp(prefix="gb2api-proxy-auth-")
+        manifest = {
+            "manifest_version": 3,
+            "name": "Gemini Business2API Proxy Auth",
+            "version": "1.0.0",
+            "permissions": [
+                "proxy",
+                "storage",
+                "webRequest",
+                "webRequestAuthProvider",
+            ],
+            "host_permissions": ["<all_urls>"],
+            "background": {
+                "service_worker": "background.js",
+            },
+        }
+        proxy_config = {
+            "mode": "fixed_servers",
+            "rules": {
+                "singleProxy": {
+                    "scheme": scheme,
+                    "host": host,
+                    "port": port,
+                },
+                "bypassList": ["localhost", "127.0.0.1"],
+            },
+        }
+        credentials = {
+            "username": username,
+            "password": password,
+        }
+        background = f"""
+const proxyConfig = {json.dumps(proxy_config, ensure_ascii=False)};
+const credentials = {json.dumps(credentials, ensure_ascii=False)};
+
+function applyProxyConfig() {{
+  chrome.proxy.settings.set({{ value: proxyConfig, scope: 'regular' }}, () => {{}});
+}}
+
+chrome.runtime.onInstalled.addListener(applyProxyConfig);
+chrome.runtime.onStartup.addListener(applyProxyConfig);
+applyProxyConfig();
+
+chrome.webRequest.onAuthRequired.addListener(
+  () => ({{ authCredentials: credentials }}),
+  {{ urls: ['<all_urls>'] }},
+  ['blocking']
+);
+""".strip()
+
+        Path(extension_dir, "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        Path(extension_dir, "background.js").write_text(background, encoding="utf-8")
+        warnings.append("已为浏览器临时注入代理认证扩展，用于处理带账号密码的 HTTP 代理。")
+        return {
+            "browser_proxy_url": f"{scheme}://{host}:{port}",
+            "extension_dir": extension_dir,
+            "apply_via_argument": False,
+            "warnings": warnings,
+        }
+
+    return {
+        "browser_proxy_url": f"{scheme}://{host}:{port}",
+        "extension_dir": None,
+        "apply_via_argument": True,
+        "warnings": warnings,
+    }
+
+
+def cleanup_temp_dir(path: Optional[str]) -> None:
+    """清理临时目录。"""
+    if not path:
+        return
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _normalize_geo_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "ip": payload.get("ip") or payload.get("query") or payload.get("ipAddress") or "",
+        "country": payload.get("country") or payload.get("country_name") or "",
+        "country_code": payload.get("country_code") or payload.get("countryCode") or "",
+        "region": payload.get("region") or payload.get("region_name") or "",
+        "city": payload.get("city") or "",
+        "organization": payload.get("organization") or payload.get("org") or payload.get("isp") or payload.get("asn_organization") or "",
+    }
+
+
+def _extract_geo_payload_from_text(text: str) -> Dict[str, Any]:
+    if not text:
+        return {}
+    try:
+        return _normalize_geo_payload(json.loads(text))
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            return _normalize_geo_payload(json.loads(match.group(0)))
+        except Exception:
+            return {}
+    return {}
+
+
+def _normalize_proxy_type(proxy_type: str) -> str:
+    value = (proxy_type or "auto").strip().lower()
+    if value in ("auto", "standard", "resin"):
+        return value
+    return "auto"
+
+
+def _build_proxy_test_warnings(
+    proxy_setting: str,
+    proxy_url: str,
+    *,
+    purpose: str = "",
+    proxy_type: str = "auto",
+) -> List[str]:
+    proxy_type = _normalize_proxy_type(proxy_type)
+    warnings: List[str] = []
+    resin = parse_resin_proxy_action(proxy_url)
+    if proxy_type == "resin" and not resin:
+        warnings.append("当前已选择 Resin 代理，但地址不符合 Resin 标准格式；rotate 和平台/账号识别不会生效。")
+    if proxy_type == "standard" and resin:
+        warnings.append("当前已选择普通代理，但地址看起来是 Resin 标准地址；如果要使用 rotate 和平台/账号识别，建议切换为 Resin 代理。")
+
+    if resin and "{account}" not in (proxy_setting or "") and "{account_id}" not in (proxy_setting or "") and "{email}" not in (proxy_setting or ""):
+        warnings.append("当前是固定账号地址，所有账号会共享同一个粘性租约；如果要按账号独立保持 IP，建议改成 {account} 模板。")
+
+    if resin and purpose == "auth" and resin["platform"].strip().lower() == "chat":
+        warnings.append("当前是账户操作代理，但平台名看起来是 chat；如果你有独立的 auth 平台，建议改成 auth.{account}。")
+    if resin and purpose == "chat" and resin["platform"].strip().lower() == "auth":
+        warnings.append("当前是聊天操作代理，但平台名看起来是 auth；如果你有独立的 chat 平台，建议改成 chat.{account}。")
+
+    components = parse_proxy_components(proxy_url)
+    if components and (components["username"] or components["password"]):
+        warnings.append("这是带认证信息的代理地址，HTTP 客户端通常可直接使用；浏览器层需要额外处理代理认证。")
+    return warnings
+
+
+def probe_http_proxy_sync(
+    proxy_setting: str,
+    *,
+    purpose: str = "",
+    proxy_type: str = "auto",
+    account_id: str = "",
+    email: str = "",
+    default_account: str = "proxy_test",
+    timeout: float = 15.0,
+) -> Dict[str, Any]:
+    """通过 requests 验证代理的 HTTP 连通性，并返回出口地理信息。"""
+    proxy_url, no_proxy = resolve_proxy_setting(
+        proxy_setting,
+        account_id=account_id,
+        email=email,
+        default_account=default_account,
+    )
+    if not proxy_url:
+        raise ValueError("代理地址为空")
+
+    warnings = _build_proxy_test_warnings(proxy_setting, proxy_url, purpose=purpose, proxy_type=proxy_type)
+    last_error = None
+    for endpoint in _PROXY_GEO_ENDPOINTS:
+        try:
+            response = requests.get(
+                endpoint,
+                proxies={"http": proxy_url, "https": proxy_url},
+                timeout=timeout,
+                verify=False,
+                headers={"Accept": "application/json"},
+            )
+            response.raise_for_status()
+            geo = _extract_geo_payload_from_text(response.text)
+            if not geo:
+                raise ValueError("地理信息返回无法解析")
+
+            return {
+                "success": True,
+                "mode": "http",
+                "proxy_url": mask_proxy_url(proxy_url),
+                "no_proxy": no_proxy,
+                "endpoint": endpoint,
+                "warnings": warnings,
+                "geo": geo,
+                "resin": parse_resin_proxy_action(proxy_url),
+            }
+        except Exception as exc:
+            last_error = str(exc)
+
+    return {
+        "success": False,
+        "mode": "http",
+        "proxy_url": mask_proxy_url(proxy_url),
+        "no_proxy": no_proxy,
+        "warnings": warnings,
+        "resin": parse_resin_proxy_action(proxy_url),
+        "error": last_error or "代理连通性测试失败",
+    }
+
+
+def probe_browser_proxy_sync(
+    proxy_setting: str,
+    *,
+    purpose: str = "",
+    proxy_type: str = "auto",
+    account_id: str = "",
+    email: str = "",
+    default_account: str = "proxy_test",
+    browser_mode: str = "normal",
+    user_agent: str = "",
+    timeout: float = 20.0,
+) -> Dict[str, Any]:
+    """使用真实 Chromium 浏览器验证代理是否生效。"""
+    proxy_url, no_proxy = resolve_proxy_setting(
+        proxy_setting,
+        account_id=account_id,
+        email=email,
+        default_account=default_account,
+    )
+    if not proxy_url:
+        raise ValueError("代理地址为空")
+
+    from DrissionPage import ChromiumOptions, ChromiumPage
+
+    warnings = _build_proxy_test_warnings(proxy_setting, proxy_url, purpose=purpose, proxy_type=proxy_type)
+    chromium_path = find_chromium_path()
+    if not chromium_path:
+        return {
+            "success": False,
+            "mode": "browser",
+            "proxy_url": mask_proxy_url(proxy_url),
+            "no_proxy": no_proxy,
+            "warnings": warnings,
+            "resin": parse_resin_proxy_action(proxy_url),
+            "error": "当前运行环境未找到 Chromium/Chrome，可先使用 HTTP 测试确认代理可达。",
+        }
+
+    options = ChromiumOptions()
+    options.set_browser_path(chromium_path)
+    options.set_argument("--incognito")
+    options.set_argument("--no-sandbox")
+    options.set_argument("--disable-dev-shm-usage")
+    options.set_argument("--disable-setuid-sandbox")
+    options.set_argument("--disable-blink-features=AutomationControlled")
+    options.set_argument("--lang=zh-CN")
+    options.set_pref("intl.accept_languages", "zh-CN,zh")
+    options.set_argument("--window-size=1366,768")
+    if user_agent:
+        options.set_user_agent(user_agent)
+
+    extension_dir = None
+    try:
+        proxy_config = prepare_chromium_proxy(proxy_url)
+        extension_dir = proxy_config["extension_dir"]
+        warnings.extend(proxy_config["warnings"])
+        if proxy_config["apply_via_argument"]:
+            options.set_argument("--proxy-server", proxy_config["browser_proxy_url"])
+        else:
+            options.set_proxy(proxy_config["browser_proxy_url"])
+        if extension_dir:
+            options.add_extension(extension_dir)
+
+        normalized_mode = (browser_mode or "normal").strip().lower()
+        if normalized_mode == "headless":
+            options.set_argument("--headless", "new")
+            options.set_argument("--disable-gpu")
+        elif normalized_mode == "silent":
+            options.set_argument("--start-minimized")
+
+        options.auto_port()
+        page = ChromiumPage(options)
+        user_data_dir = getattr(page, "user_data_dir", None)
+        try:
+            page.set.timeouts(timeout)
+            last_error = None
+            for endpoint in _PROXY_GEO_ENDPOINTS:
+                try:
+                    page.get(endpoint, timeout=timeout, show_errmsg=True)
+                    body = page.ele("tag:body", timeout=5)
+                    text = body.text if body else (page.html or "")
+                    geo = _extract_geo_payload_from_text(text)
+                    if not geo:
+                        raise ValueError("浏览器返回未包含可解析的出口信息")
+                    return {
+                        "success": True,
+                        "mode": "browser",
+                        "proxy_url": mask_proxy_url(proxy_url),
+                        "no_proxy": no_proxy,
+                        "endpoint": endpoint,
+                        "warnings": warnings,
+                        "geo": geo,
+                        "browser_mode": normalized_mode,
+                        "resin": parse_resin_proxy_action(proxy_url),
+                    }
+                except Exception as exc:
+                    last_error = str(exc)
+            return {
+                "success": False,
+                "mode": "browser",
+                "proxy_url": mask_proxy_url(proxy_url),
+                "no_proxy": no_proxy,
+                "warnings": warnings,
+                "browser_mode": normalized_mode,
+                "resin": parse_resin_proxy_action(proxy_url),
+                "error": last_error or "浏览器代理测试失败",
+            }
+        finally:
+            try:
+                page.quit()
+            except Exception:
+                pass
+            cleanup_temp_dir(user_data_dir)
+    finally:
+        cleanup_temp_dir(extension_dir)
 
 
 def rotate_resin_proxy_sync(

@@ -48,22 +48,162 @@
                   <span>账户操作代理</span>
                   <HelpTip text="用于注册/登录/刷新操作的代理，支持标准地址或 Resin 模板，例如 http://AuthPlatform.{account}:token@resin:2260" />
                 </div>
-                <input
-                  v-model="localSettings.basic.proxy_for_auth"
-                  type="text"
-                  class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
-                  placeholder="http://AuthPlatform.{account}:token@resin:2260"
-                />
+                <div class="space-y-2">
+                  <div class="flex flex-wrap gap-2">
+                    <button
+                      v-for="option in proxyTypeOptions"
+                      :key="`auth-${option.value}`"
+                      type="button"
+                      class="rounded-full border px-3 py-1 text-xs font-medium transition-colors"
+                      :class="localSettings.basic.proxy_for_auth_type === option.value ? 'border-primary bg-primary/10 text-primary' : 'border-border text-muted-foreground hover:text-foreground'"
+                      @click="localSettings.basic.proxy_for_auth_type = option.value"
+                    >
+                      {{ option.label }}
+                    </button>
+                  </div>
+                  <input
+                    v-model="localSettings.basic.proxy_for_auth"
+                    type="text"
+                    class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
+                    placeholder="http://AuthPlatform.{account}:token@resin:2260"
+                  />
+                  <p class="text-xs text-muted-foreground">
+                    {{ proxyTypeHint(localSettings.basic.proxy_for_auth_type, 'auth') }}
+                  </p>
+                  <div class="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      class="rounded-full border border-border px-3 py-1 text-xs font-medium text-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+                      :disabled="!localSettings.basic.proxy_for_auth || proxyTestState.auth.loading !== null"
+                      @click="runProxyTest('auth', 'http')"
+                    >
+                      {{ proxyTestState.auth.loading === 'http' ? 'HTTP 测试中...' : 'HTTP 测试' }}
+                    </button>
+                    <button
+                      type="button"
+                      class="rounded-full border border-border px-3 py-1 text-xs font-medium text-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+                      :disabled="!localSettings.basic.proxy_for_auth || proxyTestState.auth.loading !== null"
+                      @click="runProxyTest('auth', 'browser')"
+                    >
+                      {{ proxyTestState.auth.loading === 'browser' ? '浏览器测试中...' : '浏览器测试' }}
+                    </button>
+                  </div>
+                  <div class="space-y-2">
+                    <div
+                      v-for="mode in proxyModes"
+                      :key="`auth-${mode}`"
+                      v-if="proxyTestState.auth.results[mode]"
+                      class="rounded-2xl border px-3 py-2 text-xs"
+                      :class="proxyTestState.auth.results[mode]?.success ? 'border-emerald-200 bg-emerald-50 text-emerald-900' : 'border-amber-200 bg-amber-50 text-amber-900'"
+                    >
+                      <p class="font-medium">
+                        {{ mode === 'http' ? 'HTTP 测试' : '浏览器测试' }}
+                        <span class="ml-1">{{ proxyTestState.auth.results[mode]?.success ? '成功' : '失败' }}</span>
+                      </p>
+                      <p v-if="proxyTestState.auth.results[mode]?.geo?.ip" class="mt-1">
+                        出口 IP：{{ proxyTestState.auth.results[mode]?.geo?.ip }}
+                        <span v-if="formatGeoLabel(proxyTestState.auth.results[mode])">
+                          · {{ formatGeoLabel(proxyTestState.auth.results[mode]) }}
+                        </span>
+                      </p>
+                      <p v-if="proxyTestState.auth.results[mode]?.geo?.organization" class="mt-1">
+                        线路：{{ proxyTestState.auth.results[mode]?.geo?.organization }}
+                      </p>
+                      <p v-if="proxyTestState.auth.results[mode]?.resin" class="mt-1">
+                        Resin：{{ proxyTestState.auth.results[mode]?.resin?.platform }} / {{ proxyTestState.auth.results[mode]?.resin?.account }}
+                      </p>
+                      <p v-if="proxyTestState.auth.results[mode]?.error" class="mt-1">
+                        错误：{{ proxyTestState.auth.results[mode]?.error }}
+                      </p>
+                      <ul
+                        v-if="proxyTestState.auth.results[mode]?.warnings?.length"
+                        class="mt-1 list-disc space-y-1 pl-4"
+                      >
+                        <li v-for="warning in proxyTestState.auth.results[mode]?.warnings" :key="warning">{{ warning }}</li>
+                      </ul>
+                    </div>
+                  </div>
+                </div>
                 <div class="flex items-center justify-between gap-2 text-xs text-muted-foreground">
                   <span>聊天操作代理</span>
                   <HelpTip text="用于 JWT/会话/消息操作的代理，支持标准地址或 Resin 模板，例如 http://ChatPlatform.{account}:token@resin:2260" />
                 </div>
-                <input
-                  v-model="localSettings.basic.proxy_for_chat"
-                  type="text"
-                  class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
-                  placeholder="http://ChatPlatform.{account}:token@resin:2260"
-                />
+                <div class="space-y-2">
+                  <div class="flex flex-wrap gap-2">
+                    <button
+                      v-for="option in proxyTypeOptions"
+                      :key="`chat-${option.value}`"
+                      type="button"
+                      class="rounded-full border px-3 py-1 text-xs font-medium transition-colors"
+                      :class="localSettings.basic.proxy_for_chat_type === option.value ? 'border-primary bg-primary/10 text-primary' : 'border-border text-muted-foreground hover:text-foreground'"
+                      @click="localSettings.basic.proxy_for_chat_type = option.value"
+                    >
+                      {{ option.label }}
+                    </button>
+                  </div>
+                  <input
+                    v-model="localSettings.basic.proxy_for_chat"
+                    type="text"
+                    class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
+                    placeholder="http://ChatPlatform.{account}:token@resin:2260"
+                  />
+                  <p class="text-xs text-muted-foreground">
+                    {{ proxyTypeHint(localSettings.basic.proxy_for_chat_type, 'chat') }}
+                  </p>
+                  <div class="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      class="rounded-full border border-border px-3 py-1 text-xs font-medium text-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+                      :disabled="!localSettings.basic.proxy_for_chat || proxyTestState.chat.loading !== null"
+                      @click="runProxyTest('chat', 'http')"
+                    >
+                      {{ proxyTestState.chat.loading === 'http' ? 'HTTP 测试中...' : 'HTTP 测试' }}
+                    </button>
+                    <button
+                      type="button"
+                      class="rounded-full border border-border px-3 py-1 text-xs font-medium text-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+                      :disabled="!localSettings.basic.proxy_for_chat || proxyTestState.chat.loading !== null"
+                      @click="runProxyTest('chat', 'browser')"
+                    >
+                      {{ proxyTestState.chat.loading === 'browser' ? '浏览器测试中...' : '浏览器测试' }}
+                    </button>
+                  </div>
+                  <div class="space-y-2">
+                    <div
+                      v-for="mode in proxyModes"
+                      :key="`chat-${mode}`"
+                      v-if="proxyTestState.chat.results[mode]"
+                      class="rounded-2xl border px-3 py-2 text-xs"
+                      :class="proxyTestState.chat.results[mode]?.success ? 'border-emerald-200 bg-emerald-50 text-emerald-900' : 'border-amber-200 bg-amber-50 text-amber-900'"
+                    >
+                      <p class="font-medium">
+                        {{ mode === 'http' ? 'HTTP 测试' : '浏览器测试' }}
+                        <span class="ml-1">{{ proxyTestState.chat.results[mode]?.success ? '成功' : '失败' }}</span>
+                      </p>
+                      <p v-if="proxyTestState.chat.results[mode]?.geo?.ip" class="mt-1">
+                        出口 IP：{{ proxyTestState.chat.results[mode]?.geo?.ip }}
+                        <span v-if="formatGeoLabel(proxyTestState.chat.results[mode])">
+                          · {{ formatGeoLabel(proxyTestState.chat.results[mode]) }}
+                        </span>
+                      </p>
+                      <p v-if="proxyTestState.chat.results[mode]?.geo?.organization" class="mt-1">
+                        线路：{{ proxyTestState.chat.results[mode]?.geo?.organization }}
+                      </p>
+                      <p v-if="proxyTestState.chat.results[mode]?.resin" class="mt-1">
+                        Resin：{{ proxyTestState.chat.results[mode]?.resin?.platform }} / {{ proxyTestState.chat.results[mode]?.resin?.account }}
+                      </p>
+                      <p v-if="proxyTestState.chat.results[mode]?.error" class="mt-1">
+                        错误：{{ proxyTestState.chat.results[mode]?.error }}
+                      </p>
+                      <ul
+                        v-if="proxyTestState.chat.results[mode]?.warnings?.length"
+                        class="mt-1 list-disc space-y-1 pl-4"
+                      >
+                        <li v-for="warning in proxyTestState.chat.results[mode]?.warnings" :key="warning">{{ warning }}</li>
+                      </ul>
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -428,13 +568,14 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
+import { settingsApi } from '@/api'
 import { useSettingsStore } from '@/stores/settings'
 import { useToast } from '@/composables/useToast'
 import { defaultMailProvider, mailProviderOptions } from '@/constants/mailProviders'
 import SelectMenu from '@/components/ui/SelectMenu.vue'
 import Checkbox from '@/components/ui/Checkbox.vue'
 import HelpTip from '@/components/ui/HelpTip.vue'
-import type { Settings } from '@/types/api'
+import type { ProxyTestResult, Settings } from '@/types/api'
 
 const settingsStore = useSettingsStore()
 const { settings, isLoading } = storeToRefs(settingsStore)
@@ -443,6 +584,29 @@ const toast = useToast()
 const localSettings = ref<Settings | null>(null)
 const isSaving = ref(false)
 const errorMessage = ref('')
+const proxyModes = ['http', 'browser'] as const
+type ProxyMode = (typeof proxyModes)[number]
+type ProxyPurpose = 'auth' | 'chat'
+
+const proxyTestState = ref<Record<ProxyPurpose, { loading: ProxyMode | null; results: Record<ProxyMode, ProxyTestResult | null> }>>({
+  auth: {
+    loading: null,
+    results: {
+      http: null,
+      browser: null,
+    },
+  },
+  chat: {
+    loading: null,
+    results: {
+      http: null,
+      browser: null,
+    },
+  },
+})
+
+const PROXY_TEST_ACCOUNT = 'account_001'
+const PROXY_TEST_EMAIL = 'proxy.test@example.com'
 
 // 429冷却时间：小时 ↔ 秒 的转换
 const DEFAULT_COOLDOWN_HOURS = {
@@ -489,6 +653,11 @@ const browserModeOptions = [
   { label: 'silent - 静默最小化', value: 'silent' },
   { label: 'headless - 无头', value: 'headless' },
 ]
+const proxyTypeOptions = [
+  { label: '自动检测', value: 'auto' },
+  { label: '普通代理', value: 'standard' },
+  { label: 'Resin 代理', value: 'resin' },
+] as const
 const tempMailProviderOptions = mailProviderOptions
 const imageOutputOptions = [
   { label: 'Base64 编码', value: 'base64' },
@@ -519,6 +688,24 @@ const imageModelOptions = computed(() => {
   return baseOptions
 })
 
+const formatGeoLabel = (result: ProxyTestResult | null | undefined) => {
+  const geo = result?.geo
+  if (!geo) return ''
+  return [geo.country, geo.region, geo.city].filter(Boolean).join(' / ')
+}
+
+const proxyTypeHint = (type: string | undefined, purpose: ProxyPurpose) => {
+  if (type === 'resin') {
+    return purpose === 'auth'
+      ? 'Resin 模式下建议使用 auth.{account} 模板，这样验证码失败时才能按账号请求 rotate。'
+      : 'Resin 模式下建议使用 chat.{account} 模板，这样每个账号会独立保持聊天出口 IP。'
+  }
+  if (type === 'standard') {
+    return '普通代理支持 HTTP/SOCKS 地址，只做通用代理连通性与浏览器代理测试，不启用 Resin 平台/账号识别。'
+  }
+  return '自动检测会根据地址格式判断是否为 Resin；如果你明确知道当前代理类型，建议手动指定。'
+}
+
 watch(settings, (value) => {
   if (!value) return
   const next = JSON.parse(JSON.stringify(value))
@@ -529,6 +716,14 @@ watch(settings, (value) => {
   next.basic = next.basic || {}
   next.basic.duckmail_base_url ||= 'https://api.duckmail.sbs'
   next.basic.duckmail_verify_ssl = next.basic.duckmail_verify_ssl ?? true
+  next.basic.proxy_for_auth_type =
+    next.basic.proxy_for_auth_type === 'auto' || next.basic.proxy_for_auth_type === 'standard' || next.basic.proxy_for_auth_type === 'resin'
+      ? next.basic.proxy_for_auth_type
+      : 'auto'
+  next.basic.proxy_for_chat_type =
+    next.basic.proxy_for_chat_type === 'auto' || next.basic.proxy_for_chat_type === 'standard' || next.basic.proxy_for_chat_type === 'resin'
+      ? next.basic.proxy_for_chat_type
+      : 'auto'
   next.basic.browser_engine = next.basic.browser_engine || 'dp'
   const normalizedBrowserMode =
     next.basic.browser_mode === 'normal' || next.basic.browser_mode === 'silent' || next.basic.browser_mode === 'headless'
@@ -616,6 +811,51 @@ watch(settings, (value) => {
 onMounted(async () => {
   await settingsStore.loadSettings()
 })
+
+const runProxyTest = async (purpose: ProxyPurpose, mode: ProxyMode) => {
+  if (!localSettings.value) return
+
+  const proxy = purpose === 'auth'
+    ? (localSettings.value.basic.proxy_for_auth || '').trim()
+    : (localSettings.value.basic.proxy_for_chat || '').trim()
+
+  if (!proxy) {
+    toast.error('请先填写代理地址')
+    return
+  }
+
+  proxyTestState.value[purpose].loading = mode
+  errorMessage.value = ''
+  try {
+    const result = await settingsApi.testProxy({
+      proxy,
+      mode,
+      purpose,
+      proxy_type: purpose === 'auth' ? localSettings.value.basic.proxy_for_auth_type : localSettings.value.basic.proxy_for_chat_type,
+      account_id: PROXY_TEST_ACCOUNT,
+      email: PROXY_TEST_EMAIL,
+    })
+    proxyTestState.value[purpose].results[mode] = result
+    if (result.success) {
+      const ip = result.geo?.ip ? `，出口 ${result.geo.ip}` : ''
+      toast.success(`${mode === 'http' ? 'HTTP' : '浏览器'}代理测试成功${ip}`)
+    } else {
+      toast.error(result.error || '代理测试失败')
+    }
+  } catch (error: any) {
+    const message = error.message || '代理测试失败'
+    proxyTestState.value[purpose].results[mode] = {
+      success: false,
+      mode,
+      purpose,
+      error: message,
+      warnings: [],
+    }
+    toast.error(message)
+  } finally {
+    proxyTestState.value[purpose].loading = null
+  }
+}
 
 const handleSave = async () => {
   if (!localSettings.value) return
