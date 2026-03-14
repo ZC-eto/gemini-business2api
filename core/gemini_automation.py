@@ -116,8 +116,6 @@ class GeminiAutomation:
         chromium_path = find_chromium_path()
         if chromium_path:
             options.set_browser_path(chromium_path)
-
-        options.set_argument("--incognito")
         options.set_argument("--no-sandbox")
         options.set_argument("--disable-dev-shm-usage")
         options.set_argument("--disable-setuid-sandbox")
@@ -144,12 +142,16 @@ class GeminiAutomation:
             self._proxy_extension_dir = proxy_config["extension_dir"]
             for warning in proxy_config["warnings"]:
                 self._log("warning", f"⚠️ {warning}")
+            if not proxy_config["requires_extension_auth"]:
+                options.set_argument("--incognito")
             if proxy_config["apply_via_argument"]:
                 options.set_argument("--proxy-server", proxy_config["browser_proxy_url"])
             else:
                 options.set_proxy(proxy_config["browser_proxy_url"])
             if self._proxy_extension_dir:
                 options.add_extension(self._proxy_extension_dir)
+        else:
+            options.set_argument("--incognito")
 
         if self.browser_mode == BROWSER_MODE_HEADLESS:
             # 使用新版无头模式，更接近真实浏览器

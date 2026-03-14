@@ -410,6 +410,7 @@ def prepare_chromium_proxy(proxy_url: str) -> Dict[str, Any]:
     返回：
     - browser_proxy_url: 传给 --proxy-server 的地址
     - extension_dir: 如需处理 HTTP 代理认证，则返回临时扩展目录
+    - requires_extension_auth: 是否依赖扩展处理代理认证
     - warnings: 浏览器代理层的提示信息
     """
     components = parse_proxy_components(proxy_url)
@@ -418,6 +419,7 @@ def prepare_chromium_proxy(proxy_url: str) -> Dict[str, Any]:
             "browser_proxy_url": proxy_url,
             "extension_dir": None,
             "apply_via_argument": True,
+            "requires_extension_auth": False,
             "warnings": ["代理地址无法解析，浏览器可能无法使用该配置。"],
         }
 
@@ -434,6 +436,7 @@ def prepare_chromium_proxy(proxy_url: str) -> Dict[str, Any]:
                 "browser_proxy_url": f"{scheme}://{host}:{port}",
                 "extension_dir": None,
                 "apply_via_argument": True,
+                "requires_extension_auth": False,
                 "warnings": [
                     "当前代理包含认证信息，但浏览器层仅为 HTTP/HTTPS 代理自动注入认证；该代理类型可能无法用于浏览器自动化。"
                 ],
@@ -495,10 +498,12 @@ chrome.webRequest.onAuthRequired.addListener(
         )
         Path(extension_dir, "background.js").write_text(background, encoding="utf-8")
         warnings.append("已为浏览器临时注入代理认证扩展，用于处理带账号密码的 HTTP 代理。")
+        warnings.append("浏览器测试已自动关闭无痕模式；否则扩展默认不会在无痕窗口中生效，可能直接触发代理认证错误。")
         return {
             "browser_proxy_url": f"{scheme}://{host}:{port}",
             "extension_dir": extension_dir,
             "apply_via_argument": False,
+            "requires_extension_auth": True,
             "warnings": warnings,
         }
 
@@ -506,6 +511,7 @@ chrome.webRequest.onAuthRequired.addListener(
         "browser_proxy_url": f"{scheme}://{host}:{port}",
         "extension_dir": None,
         "apply_via_argument": True,
+        "requires_extension_auth": False,
         "warnings": warnings,
     }
 
@@ -683,7 +689,6 @@ def probe_browser_proxy_sync(
 
     options = ChromiumOptions()
     options.set_browser_path(chromium_path)
-    options.set_argument("--incognito")
     options.set_argument("--no-sandbox")
     options.set_argument("--disable-dev-shm-usage")
     options.set_argument("--disable-setuid-sandbox")
@@ -699,6 +704,8 @@ def probe_browser_proxy_sync(
         proxy_config = prepare_chromium_proxy(proxy_url)
         extension_dir = proxy_config["extension_dir"]
         warnings.extend(proxy_config["warnings"])
+        if not proxy_config["requires_extension_auth"]:
+            options.set_argument("--incognito")
         if proxy_config["apply_via_argument"]:
             options.set_argument("--proxy-server", proxy_config["browser_proxy_url"])
         else:
