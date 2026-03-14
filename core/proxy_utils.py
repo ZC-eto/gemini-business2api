@@ -18,8 +18,12 @@ import json
 import os
 import re
 import shutil
+import socket
+import socketserver
+import select
 import tempfile
 import threading
+import base64
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Tuple, Callable, Any, Optional, Dict, List
@@ -403,12 +407,210 @@ def find_chromium_path() -> Optional[str]:
     return None
 
 
+class _ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    """多线程 TCP 代理服务，供浏览器本地桥接使用。"""
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class _ProxyAuthBridge:
+    """
+    本地代理桥接：浏览器连 127.0.0.1，无认证；桥接层再向上游代理附加认证。
+
+    目的：
+    - 保持浏览器始终无痕模式；
+    - 避免依赖扩展在无痕窗口里的权限开关。
+    """
+
+    def __init__(self, *, upstream_host: str, upstream_port: int, username: str, password: str) -> None:
+        self.upstream_host = upstream_host
+        self.upstream_port = upstream_port
+        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+        self.auth_header = f"Basic {token}"
+        self._server: Optional[_ThreadedTCPServer] = None
+        self._thread: Optional[threading.Thread] = None
+        self.proxy_url: Optional[str] = None
+
+    def start(self) -> str:
+        bridge = self
+
+        class _BridgeHandler(socketserver.BaseRequestHandler):
+            def _read_until(self, sock: socket.socket, marker: bytes, max_size: int = 65536) -> bytes:
+                data = b""
+                while marker not in data and len(data) < max_size:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                return data
+
+            def _relay_tunnel(self, client: socket.socket, upstream: socket.socket) -> None:
+                sockets = [client, upstream]
+                while True:
+                    readable, _, _ = select.select(sockets, [], [], 30)
+                    if not readable:
+                        continue
+                    for src in readable:
+                        dst = upstream if src is client else client
+                        try:
+                            payload = src.recv(65536)
+                        except Exception:
+                            return
+                        if not payload:
+                            return
+                        try:
+                            dst.sendall(payload)
+                        except Exception:
+                            return
+
+            def _parse_request(self, raw_headers: bytes) -> Tuple[str, str, str, Dict[str, str]]:
+                header_text = raw_headers.decode("iso-8859-1", errors="replace")
+                lines = header_text.split("\r\n")
+                request_line = lines[0].strip()
+                method, target, version = (request_line.split(" ", 2) + ["HTTP/1.1", ""])[:3]
+                if not version:
+                    version = "HTTP/1.1"
+
+                headers: Dict[str, str] = {}
+                for line in lines[1:]:
+                    if not line or ":" not in line:
+                        continue
+                    k, v = line.split(":", 1)
+                    headers[k.strip()] = v.strip()
+                return method.upper(), target, version, headers
+
+            def _open_upstream(self) -> socket.socket:
+                return socket.create_connection((bridge.upstream_host, bridge.upstream_port), timeout=20)
+
+            def _handle_connect(self, target: str) -> None:
+                upstream = self._open_upstream()
+                try:
+                    req = (
+                        f"CONNECT {target} HTTP/1.1\r\n"
+                        f"Host: {target}\r\n"
+                        f"Proxy-Authorization: {bridge.auth_header}\r\n"
+                        "Proxy-Connection: Keep-Alive\r\n"
+                        "Connection: Keep-Alive\r\n"
+                        "\r\n"
+                    ).encode("iso-8859-1")
+                    upstream.sendall(req)
+                    response = self._read_until(upstream, b"\r\n\r\n")
+                    if not response:
+                        self.request.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                        return
+                    self.request.sendall(response)
+                    status_line = response.split(b"\r\n", 1)[0]
+                    if b" 200 " not in status_line:
+                        return
+                    self._relay_tunnel(self.request, upstream)
+                finally:
+                    try:
+                        upstream.close()
+                    except Exception:
+                        pass
+
+            def _handle_http(
+                self,
+                method: str,
+                target: str,
+                version: str,
+                headers: Dict[str, str],
+                body_remainder: bytes,
+            ) -> None:
+                upstream = self._open_upstream()
+                try:
+                    filtered: Dict[str, str] = {
+                        k: v
+                        for k, v in headers.items()
+                        if k.lower() not in ("proxy-authorization", "proxy-connection")
+                    }
+                    filtered["Proxy-Authorization"] = bridge.auth_header
+
+                    header_lines = [f"{method} {target} {version}"]
+                    for k, v in filtered.items():
+                        header_lines.append(f"{k}: {v}")
+                    payload = ("\r\n".join(header_lines) + "\r\n\r\n").encode("iso-8859-1")
+                    payload += body_remainder
+                    upstream.sendall(payload)
+
+                    content_length = int(headers.get("Content-Length", "0") or "0")
+                    remaining = max(content_length - len(body_remainder), 0)
+                    while remaining > 0:
+                        chunk = self.request.recv(min(remaining, 65536))
+                        if not chunk:
+                            break
+                        upstream.sendall(chunk)
+                        remaining -= len(chunk)
+
+                    while True:
+                        chunk = upstream.recv(65536)
+                        if not chunk:
+                            break
+                        self.request.sendall(chunk)
+                finally:
+                    try:
+                        upstream.close()
+                    except Exception:
+                        pass
+
+            def handle(self) -> None:
+                try:
+                    initial = self._read_until(self.request, b"\r\n\r\n")
+                    if not initial or b"\r\n\r\n" not in initial:
+                        return
+                    head, body = initial.split(b"\r\n\r\n", 1)
+                    method, target, version, headers = self._parse_request(head + b"\r\n")
+                    if method == "CONNECT":
+                        self._handle_connect(target)
+                    else:
+                        self._handle_http(method, target, version, headers, body)
+                except Exception:
+                    return
+
+        self._server = _ThreadedTCPServer(("127.0.0.1", 0), _BridgeHandler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        port = int(self._server.server_address[1])
+        self.proxy_url = f"http://127.0.0.1:{port}"
+        return self.proxy_url
+
+    def close(self) -> None:
+        if self._server:
+            try:
+                self._server.shutdown()
+            except Exception:
+                pass
+            try:
+                self._server.server_close()
+            except Exception:
+                pass
+        if self._thread and self._thread.is_alive():
+            try:
+                self._thread.join(timeout=1)
+            except Exception:
+                pass
+        self._server = None
+        self._thread = None
+        self.proxy_url = None
+
+
+def cleanup_proxy_bridge(bridge: Optional[_ProxyAuthBridge]) -> None:
+    """清理本地代理桥接服务。"""
+    if not bridge:
+        return
+    try:
+        bridge.close()
+    except Exception:
+        pass
+
+
 def prepare_chromium_proxy(proxy_url: str) -> Dict[str, Any]:
     """
     将代理 URL 转换为 Chromium 可用配置。
 
     返回：
     - browser_proxy_url: 传给 --proxy-server 的地址
+    - bridge: 本地认证桥接对象（如启用）
     - extension_dir: 如需处理 HTTP 代理认证，则返回临时扩展目录
     - requires_extension_auth: 是否依赖扩展处理代理认证
     - warnings: 浏览器代理层的提示信息
@@ -417,6 +619,7 @@ def prepare_chromium_proxy(proxy_url: str) -> Dict[str, Any]:
     if not components:
         return {
             "browser_proxy_url": proxy_url,
+            "bridge": None,
             "extension_dir": None,
             "apply_via_argument": True,
             "requires_extension_auth": False,
@@ -434,6 +637,7 @@ def prepare_chromium_proxy(proxy_url: str) -> Dict[str, Any]:
         if scheme not in ("http", "https"):
             return {
                 "browser_proxy_url": f"{scheme}://{host}:{port}",
+                "bridge": None,
                 "extension_dir": None,
                 "apply_via_argument": True,
                 "requires_extension_auth": False,
@@ -441,6 +645,27 @@ def prepare_chromium_proxy(proxy_url: str) -> Dict[str, Any]:
                     "当前代理包含认证信息，但浏览器层仅为 HTTP/HTTPS 代理自动注入认证；该代理类型可能无法用于浏览器自动化。"
                 ],
             }
+
+        try:
+            bridge = _ProxyAuthBridge(
+                upstream_host=host,
+                upstream_port=port,
+                username=username,
+                password=password,
+            )
+            local_proxy_url = bridge.start()
+            warnings.append("已启用本地代理桥接，浏览器将通过 127.0.0.1 转发到上游认证代理。")
+            warnings.append("当前桥接方案支持无痕模式，适合多账号并发隔离场景。")
+            return {
+                "browser_proxy_url": local_proxy_url,
+                "bridge": bridge,
+                "extension_dir": None,
+                "apply_via_argument": True,
+                "requires_extension_auth": False,
+                "warnings": warnings,
+            }
+        except Exception as exc:
+            warnings.append(f"本地代理桥接启动失败，将回退到扩展认证模式: {exc}")
 
         extension_dir = tempfile.mkdtemp(prefix="gb2api-proxy-auth-")
         manifest = {
@@ -498,9 +723,10 @@ chrome.webRequest.onAuthRequired.addListener(
         )
         Path(extension_dir, "background.js").write_text(background, encoding="utf-8")
         warnings.append("已为浏览器临时注入代理认证扩展，用于处理带账号密码的 HTTP 代理。")
-        warnings.append("浏览器测试已自动关闭无痕模式；否则扩展默认不会在无痕窗口中生效，可能直接触发代理认证错误。")
+        warnings.append("当前若强制无痕，扩展可能无法接管认证；建议检查浏览器测试结果。")
         return {
             "browser_proxy_url": f"{scheme}://{host}:{port}",
+            "bridge": None,
             "extension_dir": extension_dir,
             "apply_via_argument": False,
             "requires_extension_auth": True,
@@ -509,6 +735,7 @@ chrome.webRequest.onAuthRequired.addListener(
 
     return {
         "browser_proxy_url": f"{scheme}://{host}:{port}",
+        "bridge": None,
         "extension_dir": None,
         "apply_via_argument": True,
         "requires_extension_auth": False,
@@ -689,6 +916,7 @@ def probe_browser_proxy_sync(
 
     options = ChromiumOptions()
     options.set_browser_path(chromium_path)
+    options.set_argument("--incognito")
     options.set_argument("--no-sandbox")
     options.set_argument("--disable-dev-shm-usage")
     options.set_argument("--disable-setuid-sandbox")
@@ -699,13 +927,12 @@ def probe_browser_proxy_sync(
     if user_agent:
         options.set_user_agent(user_agent)
 
+    proxy_config: Optional[Dict[str, Any]] = None
     extension_dir = None
     try:
         proxy_config = prepare_chromium_proxy(proxy_url)
         extension_dir = proxy_config["extension_dir"]
         warnings.extend(proxy_config["warnings"])
-        if not proxy_config["requires_extension_auth"]:
-            options.set_argument("--incognito")
         if proxy_config["apply_via_argument"]:
             options.set_argument("--proxy-server", proxy_config["browser_proxy_url"])
         else:
@@ -765,6 +992,7 @@ def probe_browser_proxy_sync(
             cleanup_temp_dir(user_data_dir)
     finally:
         cleanup_temp_dir(extension_dir)
+        cleanup_proxy_bridge(proxy_config.get("bridge") if proxy_config else None)
 
 
 def rotate_resin_proxy_sync(
