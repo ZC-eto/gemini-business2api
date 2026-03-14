@@ -84,7 +84,9 @@ export interface Settings {
   basic: {
     api_key?: string
     base_url?: string
+    proxy_for_auth_type?: 'auto' | 'standard' | 'resin'
     proxy_for_auth?: string
+    proxy_for_chat_type?: 'auto' | 'standard' | 'resin'
     proxy_for_chat?: string
     duckmail_base_url?: string
     duckmail_api_key?: string
@@ -149,6 +151,45 @@ export interface Settings {
     images_daily_limit: number
     videos_daily_limit: number
   }
+}
+
+export interface ProxyTestRequest {
+  proxy: string
+  mode: 'http' | 'browser'
+  purpose: 'auth' | 'chat'
+  proxy_type?: 'auto' | 'standard' | 'resin'
+  account_id?: string
+  email?: string
+}
+
+export interface ProxyGeoInfo {
+  ip?: string
+  country?: string
+  country_code?: string
+  region?: string
+  city?: string
+  organization?: string
+}
+
+export interface ResinProxyInfo {
+  base_url: string
+  platform: string
+  account: string
+  token: string
+}
+
+export interface ProxyTestResult {
+  success: boolean
+  mode: 'http' | 'browser'
+  purpose: 'auth' | 'chat'
+  proxy_url?: string
+  no_proxy?: string
+  endpoint?: string
+  warnings?: string[]
+  error?: string
+  geo?: ProxyGeoInfo
+  browser_mode?: string
+  resin?: ResinProxyInfo | null
 }
 
 export interface LogEntry {

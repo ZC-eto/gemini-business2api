@@ -66,7 +66,13 @@ from core.account import (
     bulk_update_account_disabled_status as _bulk_update_account_disabled_status,
     bulk_delete_accounts as _bulk_delete_accounts
 )
-from core.proxy_utils import ProxyTemplateAsyncClient, parse_proxy_setting, proxy_runtime_context
+from core.proxy_utils import (
+    ProxyTemplateAsyncClient,
+    parse_proxy_setting,
+    probe_browser_proxy_sync,
+    probe_http_proxy_sync,
+    proxy_runtime_context,
+)
 
 # 导入 Uptime 追踪器
 from core import uptime as uptime_tracker
@@ -1658,6 +1664,15 @@ async def admin_bulk_disable_accounts(request: Request, account_ids: list[str]):
     return {"status": "success", "success_count": success_count, "errors": errors}
 
 # ---------- Auth endpoints (API) ----------
+class ProxyTestRequest(BaseModel):
+    proxy: str
+    mode: str = "http"
+    purpose: str = "auth"
+    proxy_type: str = "auto"
+    account_id: str = ""
+    email: str = ""
+
+
 @app.get("/admin/settings")
 @require_login()
 async def admin_get_settings(request: Request):
@@ -1667,7 +1682,9 @@ async def admin_get_settings(request: Request):
         "basic": {
             "api_key": config.basic.api_key,
             "base_url": config.basic.base_url,
+            "proxy_for_auth_type": config.basic.proxy_for_auth_type,
             "proxy_for_auth": config.basic.proxy_for_auth,
+            "proxy_for_chat_type": config.basic.proxy_for_chat_type,
             "proxy_for_chat": config.basic.proxy_for_chat,
             "duckmail_base_url": config.basic.duckmail_base_url,
             "duckmail_api_key": config.basic.duckmail_api_key,
@@ -1735,6 +1752,62 @@ async def admin_get_settings(request: Request):
         }
     }
 
+
+@app.post("/admin/settings/proxy-test")
+@require_login()
+async def admin_test_proxy(request: Request, payload: ProxyTestRequest):
+    """测试设置页中的代理是否可达。"""
+    proxy_value = (payload.proxy or "").strip()
+    if not proxy_value:
+        raise HTTPException(status_code=400, detail="代理地址不能为空")
+
+    mode = (payload.mode or "http").strip().lower()
+    purpose = (payload.purpose or "auth").strip().lower()
+    proxy_type = (payload.proxy_type or "auto").strip().lower()
+    account_id = (payload.account_id or "").strip()
+    email = (payload.email or "").strip()
+
+    if mode not in ("http", "browser"):
+        raise HTTPException(status_code=400, detail="mode 必须是 http 或 browser")
+    if purpose not in ("auth", "chat"):
+        raise HTTPException(status_code=400, detail="purpose 必须是 auth 或 chat")
+    if proxy_type not in ("auto", "standard", "resin"):
+        raise HTTPException(status_code=400, detail="proxy_type 必须是 auto / standard / resin")
+
+    default_account = f"{purpose}_proxy_test"
+    try:
+        if mode == "http":
+            result = await asyncio.to_thread(
+                probe_http_proxy_sync,
+                proxy_value,
+                purpose=purpose,
+                proxy_type=proxy_type,
+                account_id=account_id,
+                email=email,
+                default_account=default_account,
+                timeout=15.0,
+            )
+        else:
+            result = await asyncio.to_thread(
+                probe_browser_proxy_sync,
+                proxy_value,
+                purpose=purpose,
+                proxy_type=proxy_type,
+                account_id=account_id,
+                email=email,
+                default_account=default_account,
+                browser_mode=config.basic.browser_mode,
+                timeout=20.0,
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"代理测试失败: {exc}") from exc
+
+    result["purpose"] = purpose
+    result["mode"] = mode
+    return result
+
 @app.put("/admin/settings")
 @require_login()
 async def admin_update_settings(request: Request, new_settings: dict = Body(...)):
@@ -1772,6 +1845,8 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
         basic.setdefault("browser_engine", config.basic.browser_engine)
         basic.setdefault("browser_mode", config.basic.browser_mode)
         basic.setdefault("browser_headless", config.basic.browser_headless)
+        basic.setdefault("proxy_for_auth_type", config.basic.proxy_for_auth_type)
+        basic.setdefault("proxy_for_chat_type", config.basic.proxy_for_chat_type)
         basic.setdefault("refresh_window_hours", config.basic.refresh_window_hours)
         basic.setdefault("register_default_count", config.basic.register_default_count)
         basic.setdefault("register_domain", config.basic.register_domain)
@@ -1788,6 +1863,12 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
             browser_mode = "headless" if browser_headless else "normal"
         basic["browser_mode"] = browser_mode
         basic["browser_headless"] = browser_mode == "headless"
+        basic["proxy_for_auth_type"] = str(basic.get("proxy_for_auth_type") or "auto").strip().lower()
+        basic["proxy_for_chat_type"] = str(basic.get("proxy_for_chat_type") or "auto").strip().lower()
+        if basic["proxy_for_auth_type"] not in ("auto", "standard", "resin"):
+            raise HTTPException(status_code=400, detail="proxy_for_auth_type 必须是 auto / standard / resin")
+        if basic["proxy_for_chat_type"] not in ("auto", "standard", "resin"):
+            raise HTTPException(status_code=400, detail="proxy_for_chat_type 必须是 auto / standard / resin")
 
         basic.pop("duckmail_proxy", None)
         new_settings["basic"] = basic

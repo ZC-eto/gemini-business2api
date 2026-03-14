@@ -315,6 +315,7 @@ class LoginService(BaseTaskService[LoginTask]):
         configured_auth_attempts = int(getattr(config.retry, "verification_code_attempts", 3) or 1)
         configured_auth_attempts = max(1, min(10, configured_auth_attempts))
         max_auth_attempts = configured_auth_attempts if proxy_source else 1
+        allow_resin_rotate = (getattr(config.basic, "proxy_for_auth_type", "auto") or "auto").strip().lower() != "standard"
         result = None
         for auth_attempt in range(1, max_auth_attempts + 1):
             automation = GeminiAutomation(
@@ -336,7 +337,7 @@ class LoginService(BaseTaskService[LoginTask]):
                 break
 
             error = result.get("error", "自动化流程失败")
-            if auth_attempt < max_auth_attempts and _should_rotate_auth_proxy(error):
+            if auth_attempt < max_auth_attempts and allow_resin_rotate and _should_rotate_auth_proxy(error):
                 rotated = rotate_resin_proxy_sync(
                     proxy_source,
                     account_id=account_id,
