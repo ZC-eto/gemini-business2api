@@ -74,7 +74,9 @@ from core.proxy_utils import (
     probe_browser_proxy_sync,
     probe_http_proxy_sync,
     proxy_runtime_context,
+    record_proxy_runtime_test_result,
     refresh_proxy_runtime_status,
+    reset_proxy_runtime_status,
     resolve_proxy_setting,
     rotate_resin_proxy_sync,
     update_proxy_runtime_rotation_status,
@@ -1812,6 +1814,17 @@ async def admin_test_proxy(request: Request, payload: ProxyTestRequest):
 
     result["purpose"] = purpose
     result["mode"] = mode
+    await asyncio.to_thread(
+        record_proxy_runtime_test_result,
+        purpose,
+        proxy_setting=proxy_value,
+        result=result,
+        proxy_type=proxy_type,
+        account_id=account_id,
+        email=email,
+        default_account=default_account,
+        source=f"设置页{mode.upper()}测试",
+    )
     return result
 
 
@@ -1964,6 +1977,17 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
         SESSION_CACHE_TTL_SECONDS = config.retry.session_cache_ttl_seconds
         AUTO_REFRESH_ACCOUNTS_SECONDS = config.retry.auto_refresh_accounts_seconds
         SESSION_EXPIRE_HOURS = config.session.expire_hours
+
+        auth_proxy_value = str(config.basic.proxy_for_auth or "").strip()
+        chat_proxy_value = str(config.basic.proxy_for_chat or "").strip()
+        if not auth_proxy_value:
+            await asyncio.to_thread(reset_proxy_runtime_status, "auth", note="未配置账户操作代理")
+        if not chat_proxy_value:
+            await asyncio.to_thread(reset_proxy_runtime_status, "chat", note="未配置聊天操作代理")
+        if not config.basic.mail_proxy_enabled:
+            await asyncio.to_thread(reset_proxy_runtime_status, "mail", note="临时邮箱轮询当前直连")
+        elif not auth_proxy_value:
+            await asyncio.to_thread(reset_proxy_runtime_status, "mail", note="临时邮箱轮询复用账户代理，但当前未配置账户操作代理")
 
         # 检查是否需要重建 HTTP 客户端（代理变化）
         if old_proxy_for_auth != PROXY_FOR_AUTH_TEMPLATE or old_proxy_for_chat != PROXY_FOR_CHAT_TEMPLATE:

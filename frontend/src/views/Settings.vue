@@ -261,7 +261,7 @@
               <div class="flex items-center justify-between gap-3">
                 <div>
                   <p class="text-xs uppercase tracking-[0.3em] text-muted-foreground">当前代理状态</p>
-                  <p class="mt-2 text-xs text-muted-foreground">这里显示最近一次真实流量使用到的代理链路，不是静态配置预览。</p>
+                  <p class="mt-2 text-xs text-muted-foreground">这里优先显示最近一次自动测试或真实流量使用到的代理链路，不是静态配置预览。</p>
                 </div>
                 <button
                   type="button"
@@ -271,41 +271,13 @@
                   刷新状态
                 </button>
               </div>
-              <div class="mt-4 space-y-3">
-                <div
-                  v-for="runtime in proxyRuntimeCards"
-                  :key="runtime.purpose"
-                  class="rounded-2xl border border-border bg-muted/20 px-4 py-3"
-                >
-                  <div class="flex items-start justify-between gap-3">
-                    <div>
-                      <p class="text-sm font-medium text-foreground">{{ runtime.label }}</p>
-                      <p class="mt-1 text-xs text-muted-foreground">{{ proxyRuntimeSummary(runtime) }}</p>
-                    </div>
-                    <span
-                      class="inline-flex items-center rounded-full border px-3 py-1 text-xs font-medium"
-                      :class="proxyRuntimeBadgeClass(runtime)"
-                    >
-                      {{ proxyRuntimeBadge(runtime) }}
-                    </span>
-                  </div>
-                  <div class="mt-3 space-y-1 text-xs text-muted-foreground">
-                    <p v-if="runtime.account_id">账号：{{ runtime.account_id }}</p>
-                    <p v-if="runtime.proxy_url">代理：{{ runtime.proxy_url }}</p>
-                    <p v-if="runtime.geo?.ip">
-                      出口 IP：{{ runtime.geo.ip }}
-                      <span v-if="formatRuntimeGeoLabel(runtime)">
-                        · {{ formatRuntimeGeoLabel(runtime) }}
-                      </span>
-                    </p>
-                    <p v-if="runtime.geo?.organization">线路：{{ runtime.geo.organization }}</p>
-                    <p v-if="runtime.resin">Resin：{{ runtime.resin.platform }} / {{ runtime.resin.account }}</p>
-                    <p v-if="runtime.note && runtime.mode !== 'idle'">{{ runtime.note }}</p>
-                    <p>更新时间：{{ formatRuntimeUpdatedAt(runtime.updated_at) }}</p>
-                    <p v-if="runtime.error">错误：{{ runtime.error }}</p>
-                    <p v-else-if="runtime.geo_error">位置探测：{{ runtime.geo_error }}</p>
-                  </div>
-                </div>
+              <div class="mt-4">
+                <ProxyRuntimeOverview
+                  :auth="proxyRuntimeState.auth"
+                  :chat="proxyRuntimeState.chat"
+                  :mail="proxyRuntimeState.mail"
+                  :mail-proxy-enabled="Boolean(localSettings?.basic?.mail_proxy_enabled)"
+                />
               </div>
             </div>
 
@@ -630,6 +602,7 @@ import { defaultMailProvider, mailProviderOptions } from '@/constants/mailProvid
 import SelectMenu from '@/components/ui/SelectMenu.vue'
 import Checkbox from '@/components/ui/Checkbox.vue'
 import HelpTip from '@/components/ui/HelpTip.vue'
+import ProxyRuntimeOverview from '@/components/proxy/ProxyRuntimeOverview.vue'
 import type { ProxyRuntimePurpose, ProxyRuntimeStatus, ProxyTestResult, Settings } from '@/types/api'
 
 const settingsStore = useSettingsStore()
@@ -779,42 +752,6 @@ const proxyTypeHint = (type: string | undefined, purpose: ProxyPurpose) => {
   return '自动检测会根据地址格式判断是否为 Resin；如果你明确知道当前代理类型，建议手动指定。'
 }
 
-const proxyRuntimeCards = computed(() => [
-  proxyRuntimeState.value.auth,
-  proxyRuntimeState.value.mail,
-  proxyRuntimeState.value.chat,
-])
-
-const proxyRuntimeBadge = (status: ProxyRuntimeStatus) => {
-  if (status.mode === 'proxy') return '代理中'
-  if (status.mode === 'direct') return '直连'
-  return '未使用'
-}
-
-const proxyRuntimeBadgeClass = (status: ProxyRuntimeStatus) => {
-  if (status.mode === 'proxy') return 'border-emerald-200 bg-emerald-50 text-emerald-900'
-  if (status.mode === 'direct') return 'border-sky-200 bg-sky-50 text-sky-900'
-  return 'border-border bg-muted/40 text-muted-foreground'
-}
-
-const formatRuntimeGeoLabel = (status: ProxyRuntimeStatus) =>
-  [status.geo?.country, status.geo?.region, status.geo?.city].filter(Boolean).join(' / ')
-
-const formatRuntimeUpdatedAt = (timestamp?: number) => {
-  if (!timestamp) return '未更新'
-  return new Date(timestamp * 1000).toLocaleString('zh-CN')
-}
-
-const proxyRuntimeSummary = (status: ProxyRuntimeStatus) => {
-  if (status.mode === 'proxy') {
-    return status.source || '最近一次实际流量已记录'
-  }
-  if (status.mode === 'direct') {
-    return status.note || '当前未通过代理，直接访问目标服务'
-  }
-  return status.note || '尚未产生实际流量'
-}
-
 const fetchProxyRuntime = async (showErrorToast = false) => {
   try {
     const response = await settingsApi.getProxyRuntime()
@@ -954,7 +891,11 @@ onBeforeUnmount(() => {
   }
 })
 
-const runProxyTest = async (purpose: ProxyPurpose, mode: ProxyMode) => {
+const executeProxyTest = async (
+  purpose: ProxyPurpose,
+  mode: ProxyMode,
+  options: { silentToast?: boolean } = {}
+) => {
   if (!localSettings.value) return
 
   const proxy = purpose === 'auth'
@@ -962,8 +903,10 @@ const runProxyTest = async (purpose: ProxyPurpose, mode: ProxyMode) => {
     : (localSettings.value.basic.proxy_for_chat || '').trim()
 
   if (!proxy) {
-    toast.error('请先填写代理地址')
-    return
+    if (!options.silentToast) {
+      toast.error('请先填写代理地址')
+    }
+    return null
   }
 
   proxyTestState.value[purpose].loading = mode
@@ -981,10 +924,15 @@ const runProxyTest = async (purpose: ProxyPurpose, mode: ProxyMode) => {
     await fetchProxyRuntime(false)
     if (result.success) {
       const ip = result.geo?.ip ? `，出口 ${result.geo.ip}` : ''
-      toast.success(`${mode === 'http' ? 'HTTP' : '浏览器'}代理测试成功${ip}`)
+      if (!options.silentToast) {
+        toast.success(`${mode === 'http' ? 'HTTP' : '浏览器'}代理测试成功${ip}`)
+      }
     } else {
-      toast.error(result.error || '代理测试失败')
+      if (!options.silentToast) {
+        toast.error(result.error || '代理测试失败')
+      }
     }
+    return result
   } catch (error: any) {
     const message = error.message || '代理测试失败'
     proxyTestState.value[purpose].results[mode] = {
@@ -994,10 +942,38 @@ const runProxyTest = async (purpose: ProxyPurpose, mode: ProxyMode) => {
       error: message,
       warnings: [],
     }
-    toast.error(message)
+    if (!options.silentToast) {
+      toast.error(message)
+    }
+    return proxyTestState.value[purpose].results[mode]
   } finally {
     proxyTestState.value[purpose].loading = null
   }
+}
+
+const runProxyTest = async (purpose: ProxyPurpose, mode: ProxyMode) => {
+  await executeProxyTest(purpose, mode)
+}
+
+const runAutomaticHttpProxyTests = async () => {
+  if (!localSettings.value) return [] as string[]
+
+  const failures: string[] = []
+  const checks: ProxyPurpose[] = ['auth', 'chat']
+  for (const purpose of checks) {
+    const proxy = purpose === 'auth'
+      ? (localSettings.value.basic.proxy_for_auth || '').trim()
+      : (localSettings.value.basic.proxy_for_chat || '').trim()
+    if (!proxy) continue
+
+    const result = await executeProxyTest(purpose, 'http', { silentToast: true })
+    if (!result?.success) {
+      failures.push(`${purpose === 'auth' ? '账户操作代理' : '聊天操作代理'}：${result?.error || 'HTTP 测试失败'}`)
+    }
+  }
+
+  await fetchProxyRuntime(false)
+  return failures
 }
 
 const handleSave = async () => {
@@ -1014,8 +990,13 @@ const handleSave = async () => {
         : 'normal'
     localSettings.value.basic.browser_headless = localSettings.value.basic.browser_mode === 'headless'
     await settingsStore.updateSettings(localSettings.value)
+    const failures = await runAutomaticHttpProxyTests()
     await fetchProxyRuntime(false)
-    toast.success('设置保存成功')
+    if (failures.length) {
+      toast.warning(`设置已保存，但代理自动测试未全部通过：${failures.join('；')}`)
+    } else {
+      toast.success('设置保存成功，代理状态已刷新')
+    }
   } catch (error: any) {
     errorMessage.value = error.message || '保存失败'
     toast.error(error.message || '保存失败')

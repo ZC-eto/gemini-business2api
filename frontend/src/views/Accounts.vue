@@ -103,7 +103,7 @@
         <button
           class="relative rounded-full border border-border px-4 py-2 text-sm font-medium transition-colors
                  hover:border-primary hover:text-primary"
-          @click="openTaskModal"
+          @click="goToTasksPage"
         >
           <span class="flex items-center gap-2">
             任务管理
@@ -233,67 +233,13 @@
         </div>
       </div>
 
-      <div class="mt-4 grid gap-3 xl:grid-cols-3">
-        <div
-          v-for="runtime in proxyRuntimeCards"
-          :key="runtime.purpose"
-          class="rounded-2xl border border-border bg-muted/20 px-4 py-3"
-        >
-          <div class="flex items-start justify-between gap-3">
-            <div>
-              <p class="text-sm font-medium text-foreground">{{ runtime.label }}</p>
-              <p class="mt-1 text-xs text-muted-foreground">{{ proxyRuntimeSummary(runtime) }}</p>
-            </div>
-            <div class="flex flex-wrap items-center justify-end gap-2">
-              <span
-                class="inline-flex items-center rounded-full border px-3 py-1 text-[11px] font-medium"
-                :class="proxyRuntimeBadgeClass(runtime)"
-              >
-                {{ proxyRuntimeBadge(runtime) }}
-              </span>
-              <span class="inline-flex items-center rounded-full border border-border bg-background px-3 py-1 text-[11px] font-medium text-foreground">
-                {{ proxyRuntimeRouteLabel(runtime) }}
-              </span>
-            </div>
-          </div>
-
-          <div class="mt-3 grid gap-1 text-xs text-muted-foreground">
-            <p v-if="runtime.account_id">账号：{{ runtime.account_id }}</p>
-            <p v-if="runtime.proxy_url">代理：{{ runtime.proxy_url }}</p>
-            <p v-if="runtime.geo?.ip">
-              出口 IP：{{ runtime.geo.ip }}
-              <span v-if="formatRuntimeGeoLabel(runtime)">
-                · {{ formatRuntimeGeoLabel(runtime) }}
-              </span>
-            </p>
-            <p v-if="runtime.geo?.organization">线路：{{ runtime.geo.organization }}</p>
-            <p v-if="formatRuntimeLatency(runtime.latency_ms)">延迟：{{ formatRuntimeLatency(runtime.latency_ms) }}</p>
-            <p v-if="runtime.resin">Resin：{{ runtime.resin.platform }} / {{ runtime.resin.account }}</p>
-          </div>
-
-          <div class="mt-3 flex flex-wrap items-center gap-2 text-[11px]">
-            <span
-              class="inline-flex items-center rounded-full border px-3 py-1 font-medium"
-              :class="proxyRuntimeRotationClass(runtime)"
-            >
-              {{ proxyRuntimeRotationLabel(runtime) }}
-            </span>
-            <span
-              v-if="runtime.cooldown_remaining_seconds"
-              class="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-3 py-1 font-medium text-amber-900"
-            >
-              冷却 {{ formatRuntimeCooldown(runtime.cooldown_remaining_seconds) }}
-            </span>
-          </div>
-
-          <div class="mt-3 space-y-1 text-xs text-muted-foreground">
-            <p v-if="runtime.last_rotation_reason">切换说明：{{ runtime.last_rotation_reason }}</p>
-            <p v-if="runtime.cooldown_reason">冷却原因：{{ runtime.cooldown_reason }}</p>
-            <p v-if="runtime.error">错误：{{ runtime.error }}</p>
-            <p v-else-if="runtime.geo_error">位置探测：{{ runtime.geo_error }}</p>
-            <p>更新时间：{{ formatRuntimeUpdatedAt(runtime.updated_at) }}</p>
-          </div>
-        </div>
+      <div class="mt-4">
+        <ProxyRuntimeOverview
+          :auth="proxyRuntimeState.auth"
+          :chat="proxyRuntimeState.chat"
+          :mail="proxyRuntimeState.mail"
+          :mail-proxy-enabled="Boolean(settings?.basic?.mail_proxy_enabled)"
+        />
       </div>
 
       <div v-if="viewMode === 'card'" class="mt-6 grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
@@ -1329,6 +1275,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
+import { useRouter } from 'vue-router'
 import { useAccountsStore } from '@/stores/accounts'
 import { useSettingsStore } from '@/stores/settings'
 import SelectMenu from '@/components/ui/SelectMenu.vue'
@@ -1338,6 +1285,7 @@ import QuotaBadge from '@/components/QuotaBadge.vue'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { useToast } from '@/composables/useToast'
 import HelpTip from '@/components/ui/HelpTip.vue'
+import ProxyRuntimeOverview from '@/components/proxy/ProxyRuntimeOverview.vue'
 import { accountsApi, settingsApi } from '@/api'
 import { mailProviderOptions, defaultMailProvider } from '@/constants/mailProviders'
 import type { AdminAccount, AccountConfigItem, RegisterTask, LoginTask, ProxyRuntimePurpose, ProxyRuntimeStatus } from '@/types/api'
@@ -1346,6 +1294,7 @@ const accountsStore = useAccountsStore()
 const { accounts, isLoading, isOperating, batchProgress } = storeToRefs(accountsStore)
 const settingsStore = useSettingsStore()
 const { settings } = storeToRefs(settingsStore)
+const router = useRouter()
 const confirmDialog = useConfirmDialog()
 const toast = useToast()
 
@@ -2247,6 +2196,11 @@ const refreshTaskSnapshot = async () => {
   }
 }
 
+const goToTasksPage = async () => {
+  await loadCurrentTasks()
+  await router.push('/tasks')
+}
+
 const openTaskModal = async () => {
   isTaskOpen.value = true
   activeTaskTab.value = 'current'
@@ -2560,6 +2514,9 @@ watch(activeTaskTab, async (newTab) => {
 onMounted(async () => {
   // 任务状态统一以后端为准，不做本地任务快照恢复
   hydrateTaskCache()
+  if (!settings.value && !settingsStore.isLoading) {
+    await settingsStore.loadSettings()
+  }
   await refreshAccounts()
   await loadCurrentTasks()
   await fetchProxyRuntime(false)
@@ -3290,7 +3247,7 @@ const handleRegister = async () => {
     syncRegisterTask(task)
     startRegisterPolling(task.id)
     isRegisterOpen.value = false
-    isTaskOpen.value = true
+    await goToTasksPage()
   } catch (error: any) {
     automationError.value = error.message || '启动注册失败'
     isRegistering.value = false
@@ -3306,8 +3263,7 @@ const startRefresh = async (accountIds: string[]) => {
     const task = await accountsApi.startLogin(accountIds)
     syncLoginTask(task)
     startLoginPolling(task.id)
-    // 自动打开任务状态弹窗
-    openTaskModal()
+    await goToTasksPage()
   } catch (error: any) {
     automationError.value = error.message || '启动刷新失败'
     toast.error(error.message || '启动刷新失败')
@@ -3328,8 +3284,7 @@ const handleRefreshExpiring = async () => {
     if (taskOrIdle && 'id' in taskOrIdle) {
       syncLoginTask(taskOrIdle)
       startLoginPolling(taskOrIdle.id)
-      // 自动打开任务状态弹窗
-      openTaskModal()
+      await goToTasksPage()
       return
     }
     // 没有新任务时，尝试读取当前任务（可能已有 running/pending）
@@ -3337,7 +3292,7 @@ const handleRefreshExpiring = async () => {
     if (current && 'id' in current) {
       syncLoginTask(current)
       startLoginPolling(current.id)
-      openTaskModal()
+      await goToTasksPage()
       return
     }
     isRefreshing.value = false

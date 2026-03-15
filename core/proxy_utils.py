@@ -491,6 +491,148 @@ def record_proxy_runtime_status(
     return snapshot
 
 
+def reset_proxy_runtime_status(
+    purpose: str,
+    *,
+    note: str = "",
+    direct: bool = False,
+) -> Dict[str, Any]:
+    """重置代理运行态，供设置保存后清理旧状态。"""
+    normalized_purpose = purpose if purpose in _PROXY_RUNTIME_PURPOSE_LABELS else "auth"
+    with _PROXY_RUNTIME_LOCK:
+        previous = dict(_PROXY_RUNTIME_STATUS.get(normalized_purpose) or _new_proxy_runtime_status(normalized_purpose))
+
+    status = _new_proxy_runtime_status(normalized_purpose)
+    mode = "direct" if direct else "idle"
+    route_kind = "direct" if direct else "idle"
+    timestamp = time.time()
+    status.update({
+        "mode": mode,
+        "mode_label": _build_runtime_mode_label(mode, route_kind),
+        "route_kind": route_kind,
+        "note": note or ("当前未通过代理，使用直连" if direct else "尚未产生实际流量"),
+        "last_rotation_status": previous.get("last_rotation_status") or "idle",
+        "last_rotation_reason": previous.get("last_rotation_reason") or "",
+        "last_rotation_at": previous.get("last_rotation_at") or 0.0,
+        "last_rotation_at_iso": previous.get("last_rotation_at_iso") or "",
+        "updated_at": timestamp,
+        "updated_at_iso": _format_runtime_timestamp(timestamp),
+    })
+    status.update(_build_runtime_cooldown_payload(status))
+
+    with _PROXY_RUNTIME_LOCK:
+        _PROXY_RUNTIME_STATUS[normalized_purpose] = status
+
+    snapshot = dict(status)
+    snapshot.pop("_proxy_url_raw", None)
+    snapshot.pop("_route_fingerprint", None)
+    return snapshot
+
+
+def record_proxy_runtime_test_result(
+    purpose: str,
+    *,
+    proxy_setting: str,
+    result: Dict[str, Any],
+    proxy_type: str = "auto",
+    account_id: str = "",
+    email: str = "",
+    default_account: str = "proxy_test",
+    source: str = "",
+) -> Dict[str, Any]:
+    """将设置页代理测试结果写入运行态缓存，供页面立即展示。"""
+    normalized_purpose = purpose if purpose in _PROXY_RUNTIME_PURPOSE_LABELS else "auth"
+    normalized_proxy_type = _normalize_proxy_type(proxy_type)
+    resolved_no_proxy = ""
+    resolved_proxy_url = ""
+    error_message = ""
+
+    try:
+        resolved_proxy_url, resolved_no_proxy = resolve_proxy_setting(
+            proxy_setting,
+            account_id=account_id,
+            email=email,
+            default_account=default_account,
+        )
+    except Exception as exc:
+        error_message = str(exc)
+
+    mode = "proxy" if resolved_proxy_url else "idle"
+    masked_proxy_url = mask_proxy_url(resolved_proxy_url) if resolved_proxy_url else ""
+    resin = parse_resin_proxy_action(resolved_proxy_url) if resolved_proxy_url else None
+    route_kind = _infer_runtime_route_kind(mode, resolved_proxy_url, resin)
+    route_fingerprint = _build_runtime_route_fingerprint(
+        purpose=normalized_purpose,
+        proxy_url=resolved_proxy_url,
+        direct=False,
+    )
+    timestamp = time.time()
+    geo_payload = dict(result.get("geo") or {})
+    geo_error = ""
+    latency_ms = result.get("latency_ms")
+    if not isinstance(latency_ms, (int, float)):
+        latency_ms = None
+
+    if resolved_proxy_url:
+        cache_payload = {
+            "geo": geo_payload,
+            "endpoint": result.get("endpoint") or "",
+            "checked_at": timestamp,
+            "latency_ms": latency_ms,
+            "error": result.get("error") or error_message or "",
+        }
+        with _PROXY_RUNTIME_LOCK:
+            _PROXY_RUNTIME_GEO_CACHE[route_fingerprint] = dict(cache_payload)
+    elif result.get("error"):
+        geo_error = str(result.get("error"))
+
+    with _PROXY_RUNTIME_LOCK:
+        previous = dict(_PROXY_RUNTIME_STATUS.get(normalized_purpose) or _new_proxy_runtime_status(normalized_purpose))
+
+    test_mode = (result.get("mode") or "http").strip().lower()
+    success = bool(result.get("success"))
+    note = (
+        f"最近一次{test_mode.upper()}测试成功"
+        if success
+        else f"最近一次{test_mode.upper()}测试失败"
+    )
+    status = _new_proxy_runtime_status(normalized_purpose)
+    status.update({
+        "mode": mode,
+        "mode_label": _build_runtime_mode_label(mode, route_kind),
+        "route_kind": route_kind,
+        "source": source or f"设置页{test_mode.upper()}测试",
+        "note": note,
+        "proxy_type": normalized_proxy_type,
+        "proxy_url": masked_proxy_url,
+        "no_proxy": resolved_no_proxy,
+        "account_id": account_id or "",
+        "email": email or "",
+        "geo": geo_payload,
+        "latency_ms": latency_ms,
+        "resin": resin,
+        "last_rotation_status": previous.get("last_rotation_status") or "idle",
+        "last_rotation_reason": previous.get("last_rotation_reason") or "",
+        "last_rotation_at": previous.get("last_rotation_at") or 0.0,
+        "last_rotation_at_iso": previous.get("last_rotation_at_iso") or "",
+        "updated_at": timestamp,
+        "updated_at_iso": _format_runtime_timestamp(timestamp),
+        "error": str(result.get("error") or error_message or ""),
+        "geo_error": geo_error,
+        "_proxy_url_raw": resolved_proxy_url,
+        "_route_fingerprint": route_fingerprint,
+    })
+    status.update(_build_runtime_cooldown_payload(status))
+
+    with _PROXY_RUNTIME_LOCK:
+        _PROXY_RUNTIME_STATUS[normalized_purpose] = status
+
+    snapshot = dict(status)
+    snapshot.pop("_proxy_url_raw", None)
+    snapshot.pop("_route_fingerprint", None)
+    return snapshot
+
+
 def get_proxy_runtime_status_snapshot(*, refresh_geo: bool = False) -> Dict[str, Dict[str, Any]]:
     """读取当前代理运行态快照。"""
     with _PROXY_RUNTIME_LOCK:
@@ -1329,6 +1471,7 @@ def probe_http_proxy_sync(
     last_error = None
     for endpoint in _PROXY_GEO_ENDPOINTS:
         try:
+            started_at = time.perf_counter()
             response = requests.get(
                 endpoint,
                 proxies={"http": proxy_url, "https": proxy_url},
@@ -1340,6 +1483,7 @@ def probe_http_proxy_sync(
             geo = _extract_geo_payload_from_text(response.text)
             if not geo:
                 raise ValueError("地理信息返回无法解析")
+            latency_ms = round((time.perf_counter() - started_at) * 1000, 1)
 
             return {
                 "success": True,
@@ -1349,6 +1493,7 @@ def probe_http_proxy_sync(
                 "endpoint": endpoint,
                 "warnings": warnings,
                 "geo": geo,
+                "latency_ms": latency_ms,
                 "resin": parse_resin_proxy_action(proxy_url),
             }
         except Exception as exc:
@@ -1443,12 +1588,14 @@ def probe_browser_proxy_sync(
             last_error = None
             for endpoint in _PROXY_GEO_ENDPOINTS:
                 try:
+                    started_at = time.perf_counter()
                     page.get(endpoint, timeout=timeout, show_errmsg=True)
                     body = page.ele("tag:body", timeout=5)
                     text = body.text if body else (page.html or "")
                     geo = _extract_geo_payload_from_text(text)
                     if not geo:
                         raise ValueError("浏览器返回未包含可解析的出口信息")
+                    latency_ms = round((time.perf_counter() - started_at) * 1000, 1)
                     return {
                         "success": True,
                         "mode": "browser",
@@ -1457,6 +1604,7 @@ def probe_browser_proxy_sync(
                         "endpoint": endpoint,
                         "warnings": warnings,
                         "geo": geo,
+                        "latency_ms": latency_ms,
                         "browser_mode": normalized_mode,
                         "resin": parse_resin_proxy_action(proxy_url),
                     }

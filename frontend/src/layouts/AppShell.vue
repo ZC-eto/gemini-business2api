@@ -351,6 +351,11 @@ const menuItems = [
     icon: 'M12 12a3.5 3.5 0 1 0-3.5-3.5A3.5 3.5 0 0 0 12 12zm0 2c-4.1 0-7.5 2.2-7.5 5v1h15v-1c0-2.8-3.4-5-7.5-5z',
   },
   {
+    path: '/tasks',
+    label: '任务管理',
+    icon: 'M6 4h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zm2 3v2h8V7H8zm0 4v2h8v-2H8zm0 4v2h5v-2H8z',
+  },
+  {
     path: '/settings',
     label: '系统设置',
     icon: 'M4 6h10v2H4V6zm12 0h4v2h-4V6zM4 11h6v2H4v-2zm8 0h8v2h-8v-2zM4 16h10v2H4v-2zm12 0h4v2h-4v-2z',
