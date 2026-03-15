@@ -176,7 +176,7 @@ python -c "from core.proxy_utils import get_proxy_runtime_status_snapshot; print
 Run:
 
 ```bash
-python -c "from pathlib import Path; pats=['锛','鍙','鎺','褰','鐢','浠','璇','涓€','宸','�']; files=['main.py','core/proxy_utils.py','core/gemini_automation.py','frontend/src/views/Accounts.vue']; bad=[]\nfor f in files:\n t=Path(f).read_text(encoding='utf-8');\n  [bad.append((f,p)) for p in pats if p in t]\nprint(bad)"
+python -c "from pathlib import Path; pats=['\\u951b','\\u9359','\\u93ba','\\u8930','\\u9422','\\u6d60','\\u7487','\\u6d93\\u20ac','\\u5bb8','\\ufffd']; files=['main.py','core/proxy_utils.py','core/gemini_automation.py','frontend/src/views/Accounts.vue']; bad=[]\nfor f in files:\n t=Path(f).read_text(encoding='utf-8');\n  [bad.append((f,p)) for p in pats if p in t]\nprint(bad)"
 ```
 
 **Step 4: Commit**
