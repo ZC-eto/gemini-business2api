@@ -23,6 +23,7 @@ import socketserver
 import select
 import tempfile
 import threading
+import time
 import base64
 from contextlib import contextmanager
 from pathlib import Path
@@ -49,6 +50,153 @@ _CHROMIUM_PATHS = (
     "/usr/bin/google-chrome",
     "/usr/bin/google-chrome-stable",
 )
+
+_PROXY_RUNTIME_PURPOSE_LABELS = {
+    "auth": "账户操作代理",
+    "mail": "临时邮箱代理",
+    "chat": "聊天操作代理",
+}
+
+_PROXY_RUNTIME_LOCK = threading.Lock()
+_PROXY_RUNTIME_GEO_TTL_SECONDS = 600.0
+_PROXY_RUNTIME_GEO_CACHE: Dict[str, Dict[str, Any]] = {}
+_PROXY_RUNTIME_ROUTE_COOLDOWNS: Dict[str, Dict[str, Any]] = {}
+_PROXY_RUNTIME_DEFAULT_COOLDOWN_SECONDS = 300.0
+
+
+def _cleanup_runtime_route_cooldowns(now: Optional[float] = None) -> None:
+    now = now or time.time()
+    expired = [
+        key
+        for key, item in _PROXY_RUNTIME_ROUTE_COOLDOWNS.items()
+        if float(item.get("until") or 0.0) <= now
+    ]
+    for key in expired:
+        _PROXY_RUNTIME_ROUTE_COOLDOWNS.pop(key, None)
+
+
+def _infer_runtime_route_kind(mode: str, proxy_url: str, resin: Optional[Dict[str, Any]]) -> str:
+    if mode == "direct":
+        return "direct"
+    if mode != "proxy":
+        return "idle"
+    if resin:
+        return "resin"
+    components = parse_proxy_components(proxy_url)
+    if not components:
+        return "proxy"
+    scheme = (components.get("scheme") or "").lower()
+    if scheme.startswith("socks"):
+        return "socks"
+    if scheme in ("http", "https"):
+        return "http"
+    return "proxy"
+
+
+def _build_runtime_mode_label(mode: str, route_kind: str) -> str:
+    if mode == "direct":
+        return "直连"
+    if mode == "idle":
+        return "未使用"
+    if route_kind == "resin":
+        return "Resin 代理"
+    if route_kind == "socks":
+        return "SOCKS 代理"
+    if route_kind == "http":
+        return "HTTP 代理"
+    return "代理"
+
+
+def _build_runtime_route_fingerprint(
+    *,
+    purpose: str,
+    proxy_url: str = "",
+    direct: bool = False,
+) -> str:
+    if direct or not proxy_url:
+        return f"direct:{purpose}"
+
+    resin = parse_resin_proxy_action(proxy_url)
+    if resin:
+        return f"resin:{resin['base_url']}|{resin['platform']}|{resin['account']}"
+
+    components = parse_proxy_components(proxy_url)
+    if not components:
+        return mask_proxy_url(proxy_url) or f"proxy:{purpose}"
+
+    username = components.get("username") or ""
+    username_part = quote(username, safe="") if username else "-"
+    return f"{components['scheme']}://{username_part}@{components['host']}:{components['port']}"
+
+
+def _build_runtime_route_key(status: Dict[str, Any]) -> str:
+    geo = status.get("geo") or {}
+    ip = (geo.get("ip") or "").strip()
+    if ip:
+        return f"ip:{ip}"
+    fingerprint = (status.get("_route_fingerprint") or "").strip()
+    if fingerprint:
+        return f"route:{fingerprint}"
+    purpose = status.get("purpose") or "auth"
+    mode = status.get("mode") or "idle"
+    return f"{mode}:{purpose}"
+
+
+def _build_runtime_cooldown_payload(status: Dict[str, Any]) -> Dict[str, Any]:
+    now = time.time()
+    route_key = _build_runtime_route_key(status)
+    with _PROXY_RUNTIME_LOCK:
+        _cleanup_runtime_route_cooldowns(now)
+        item = dict(_PROXY_RUNTIME_ROUTE_COOLDOWNS.get(route_key) or {})
+
+    until = float(item.get("until") or 0.0)
+    remaining = max(0, int(until - now)) if until > now else 0
+    return {
+        "cooldown_until": until,
+        "cooldown_until_iso": _format_runtime_timestamp(until),
+        "cooldown_remaining_seconds": remaining,
+        "cooldown_reason": item.get("reason") or "",
+    }
+
+
+def _new_proxy_runtime_status(purpose: str) -> Dict[str, Any]:
+    return {
+        "purpose": purpose,
+        "label": _PROXY_RUNTIME_PURPOSE_LABELS.get(purpose, purpose),
+        "mode": "idle",
+        "mode_label": "未使用",
+        "route_kind": "idle",
+        "source": "",
+        "note": "尚未产生实际流量",
+        "proxy_type": "auto",
+        "proxy_url": "",
+        "no_proxy": "",
+        "account_id": "",
+        "email": "",
+        "geo": {},
+        "latency_ms": None,
+        "resin": None,
+        "last_rotation_status": "idle",
+        "last_rotation_reason": "",
+        "last_rotation_at": 0.0,
+        "last_rotation_at_iso": "",
+        "cooldown_until": 0.0,
+        "cooldown_until_iso": "",
+        "cooldown_remaining_seconds": 0,
+        "cooldown_reason": "",
+        "updated_at": 0.0,
+        "updated_at_iso": "",
+        "error": "",
+        "geo_error": "",
+        "_proxy_url_raw": "",
+        "_route_fingerprint": "",
+    }
+
+
+_PROXY_RUNTIME_STATUS: Dict[str, Dict[str, Any]] = {
+    purpose: _new_proxy_runtime_status(purpose)
+    for purpose in _PROXY_RUNTIME_PURPOSE_LABELS
+}
 
 
 def parse_proxy_setting(proxy_str: str) -> Tuple[str, str]:
@@ -168,6 +316,346 @@ def resolve_proxy_setting(
         default_account=default_account,
     )
     return parse_proxy_setting(rendered)
+
+
+def _format_runtime_timestamp(timestamp: float) -> str:
+    if not timestamp:
+        return ""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+    except Exception:
+        return ""
+
+
+def _load_proxy_geo_cache(
+    proxy_url: str,
+    *,
+    refresh_if_needed: bool = False,
+    timeout: float = 6.0,
+    cache_key: str = "",
+    direct: bool = False,
+) -> Dict[str, Any]:
+    key = cache_key or mask_proxy_url(proxy_url) or proxy_url or ("__direct__" if direct else "")
+    now = time.time()
+    with _PROXY_RUNTIME_LOCK:
+        cached = dict(_PROXY_RUNTIME_GEO_CACHE.get(key) or {})
+    if not refresh_if_needed:
+        return cached
+
+    last_error = ""
+    for endpoint in _PROXY_GEO_ENDPOINTS:
+        try:
+            started_at = time.perf_counter()
+            request_kwargs: Dict[str, Any] = {
+                "timeout": timeout,
+                "verify": False,
+                "headers": {"Accept": "application/json"},
+            }
+            if proxy_url and not direct:
+                request_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+            response = requests.get(
+                endpoint,
+                **request_kwargs,
+            )
+            response.raise_for_status()
+            geo = _extract_geo_payload_from_text(response.text)
+            if not geo:
+                raise ValueError("地理信息返回无法解析")
+            latency_ms = round((time.perf_counter() - started_at) * 1000, 1)
+            payload = {
+                "geo": geo,
+                "endpoint": endpoint,
+                "checked_at": now,
+                "latency_ms": latency_ms,
+                "error": "",
+            }
+            with _PROXY_RUNTIME_LOCK:
+                _PROXY_RUNTIME_GEO_CACHE[key] = dict(payload)
+            return payload
+        except Exception as exc:
+            last_error = str(exc)
+
+    payload = {
+        "geo": cached.get("geo") or {},
+        "endpoint": cached.get("endpoint") or "",
+        "checked_at": now,
+        "latency_ms": cached.get("latency_ms"),
+        "error": last_error or "代理出口探测失败",
+    }
+    with _PROXY_RUNTIME_LOCK:
+        _PROXY_RUNTIME_GEO_CACHE[key] = dict(payload)
+    return payload
+
+
+def record_proxy_runtime_status(
+    purpose: str,
+    *,
+    proxy_setting: str = "",
+    proxy_url: str = "",
+    proxy_type: str = "auto",
+    account_id: str = "",
+    email: str = "",
+    source: str = "",
+    note: str = "",
+    default_account: str = "shared",
+    extra: Optional[Dict[str, Any]] = None,
+    direct: bool = False,
+    refresh_geo: bool = False,
+) -> Dict[str, Any]:
+    """记录最近一次真实使用到的代理链路状态，供前端实时展示。"""
+    normalized_purpose = purpose if purpose in _PROXY_RUNTIME_PURPOSE_LABELS else "auth"
+    normalized_proxy_type = _normalize_proxy_type(proxy_type)
+    resolved_no_proxy = ""
+    resolved_proxy_url = (proxy_url or "").strip()
+    error_message = ""
+
+    if not resolved_proxy_url and proxy_setting:
+        try:
+            resolved_proxy_url, resolved_no_proxy = resolve_proxy_setting(
+                proxy_setting,
+                account_id=account_id,
+                email=email,
+                extra=extra,
+                default_account=default_account,
+            )
+        except Exception as exc:
+            error_message = str(exc)
+
+    mode = "proxy" if resolved_proxy_url else ("direct" if direct else "idle")
+    masked_proxy_url = mask_proxy_url(resolved_proxy_url) if resolved_proxy_url else ""
+    resin = parse_resin_proxy_action(resolved_proxy_url) if resolved_proxy_url else None
+    route_kind = _infer_runtime_route_kind(mode, resolved_proxy_url, resin)
+    route_fingerprint = _build_runtime_route_fingerprint(
+        purpose=normalized_purpose,
+        proxy_url=resolved_proxy_url,
+        direct=mode == "direct",
+    )
+    timestamp = time.time()
+    if mode == "proxy":
+        geo_payload = _load_proxy_geo_cache(
+            resolved_proxy_url,
+            refresh_if_needed=refresh_geo,
+            cache_key=route_fingerprint,
+        )
+    elif mode == "direct":
+        geo_payload = _load_proxy_geo_cache(
+            "",
+            refresh_if_needed=refresh_geo,
+            cache_key=route_fingerprint,
+            direct=True,
+        )
+    else:
+        geo_payload = {}
+
+    with _PROXY_RUNTIME_LOCK:
+        previous = dict(_PROXY_RUNTIME_STATUS.get(normalized_purpose) or _new_proxy_runtime_status(normalized_purpose))
+
+    status = _new_proxy_runtime_status(normalized_purpose)
+    status.update({
+        "mode": mode,
+        "mode_label": _build_runtime_mode_label(mode, route_kind),
+        "route_kind": route_kind,
+        "source": source,
+        "note": note or (
+            "当前走代理链路" if mode == "proxy"
+            else "当前未配置代理，使用直连" if mode == "direct"
+            else "尚未产生实际流量"
+        ),
+        "proxy_type": normalized_proxy_type,
+        "proxy_url": masked_proxy_url,
+        "no_proxy": resolved_no_proxy,
+        "account_id": account_id or "",
+        "email": email or "",
+        "geo": geo_payload.get("geo") or {},
+        "latency_ms": geo_payload.get("latency_ms"),
+        "resin": resin,
+        "last_rotation_status": previous.get("last_rotation_status") or "idle",
+        "last_rotation_reason": previous.get("last_rotation_reason") or "",
+        "last_rotation_at": previous.get("last_rotation_at") or 0.0,
+        "last_rotation_at_iso": previous.get("last_rotation_at_iso") or "",
+        "updated_at": timestamp,
+        "updated_at_iso": _format_runtime_timestamp(timestamp),
+        "error": error_message,
+        "geo_error": geo_payload.get("error") or "",
+        "_proxy_url_raw": resolved_proxy_url,
+        "_route_fingerprint": route_fingerprint,
+    })
+    status.update(_build_runtime_cooldown_payload(status))
+
+    with _PROXY_RUNTIME_LOCK:
+        _PROXY_RUNTIME_STATUS[normalized_purpose] = status
+
+    snapshot = dict(status)
+    snapshot.pop("_proxy_url_raw", None)
+    snapshot.pop("_route_fingerprint", None)
+    return snapshot
+
+
+def get_proxy_runtime_status_snapshot(*, refresh_geo: bool = False) -> Dict[str, Dict[str, Any]]:
+    """读取当前代理运行态快照。"""
+    with _PROXY_RUNTIME_LOCK:
+        raw_snapshot = {
+            purpose: dict(value)
+            for purpose, value in _PROXY_RUNTIME_STATUS.items()
+        }
+
+    result: Dict[str, Dict[str, Any]] = {}
+    for purpose, item in raw_snapshot.items():
+        proxy_url_raw = item.pop("_proxy_url_raw", "")
+        route_fingerprint = item.get("_route_fingerprint") or ""
+        mode = item.get("mode") or "idle"
+        if mode == "proxy" and proxy_url_raw:
+            geo_payload = _load_proxy_geo_cache(
+                proxy_url_raw,
+                refresh_if_needed=refresh_geo,
+                cache_key=route_fingerprint,
+            )
+            item["geo"] = geo_payload.get("geo") or item.get("geo") or {}
+            item["geo_error"] = geo_payload.get("error") or item.get("geo_error") or ""
+            item["latency_ms"] = geo_payload.get("latency_ms")
+        elif mode == "direct":
+            geo_payload = _load_proxy_geo_cache(
+                "",
+                refresh_if_needed=refresh_geo,
+                cache_key=route_fingerprint or f"direct:{purpose}",
+                direct=True,
+            )
+            item["geo"] = geo_payload.get("geo") or item.get("geo") or {}
+            item["geo_error"] = geo_payload.get("error") or item.get("geo_error") or ""
+            item["latency_ms"] = geo_payload.get("latency_ms")
+        item.update(_build_runtime_cooldown_payload(item))
+        item.pop("_route_fingerprint", None)
+        result[purpose] = item
+    return result
+
+
+def refresh_proxy_runtime_status(
+    purpose: str,
+    *,
+    timeout: float = 6.0,
+) -> Dict[str, Any]:
+    normalized_purpose = purpose if purpose in _PROXY_RUNTIME_PURPOSE_LABELS else "auth"
+    with _PROXY_RUNTIME_LOCK:
+        current = dict(_PROXY_RUNTIME_STATUS.get(normalized_purpose) or _new_proxy_runtime_status(normalized_purpose))
+
+    proxy_url_raw = current.get("_proxy_url_raw") or ""
+    route_fingerprint = current.get("_route_fingerprint") or ""
+    mode = current.get("mode") or "idle"
+    if mode == "proxy" and proxy_url_raw:
+        geo_payload = _load_proxy_geo_cache(
+            proxy_url_raw,
+            refresh_if_needed=True,
+            timeout=timeout,
+            cache_key=route_fingerprint,
+        )
+        current["geo"] = geo_payload.get("geo") or current.get("geo") or {}
+        current["geo_error"] = geo_payload.get("error") or ""
+        current["latency_ms"] = geo_payload.get("latency_ms")
+    elif mode == "direct":
+        geo_payload = _load_proxy_geo_cache(
+            "",
+            refresh_if_needed=True,
+            timeout=timeout,
+            cache_key=route_fingerprint or f"direct:{normalized_purpose}",
+            direct=True,
+        )
+        current["geo"] = geo_payload.get("geo") or current.get("geo") or {}
+        current["geo_error"] = geo_payload.get("error") or ""
+        current["latency_ms"] = geo_payload.get("latency_ms")
+
+    current.update(_build_runtime_cooldown_payload(current))
+    with _PROXY_RUNTIME_LOCK:
+        _PROXY_RUNTIME_STATUS[normalized_purpose] = current
+
+    snapshot = dict(current)
+    snapshot.pop("_proxy_url_raw", None)
+    snapshot.pop("_route_fingerprint", None)
+    return snapshot
+
+
+def update_proxy_runtime_rotation_status(
+    purpose: str,
+    result: str,
+    reason: str = "",
+) -> Dict[str, Any]:
+    normalized_purpose = purpose if purpose in _PROXY_RUNTIME_PURPOSE_LABELS else "auth"
+    timestamp = time.time()
+    with _PROXY_RUNTIME_LOCK:
+        current = dict(_PROXY_RUNTIME_STATUS.get(normalized_purpose) or _new_proxy_runtime_status(normalized_purpose))
+        current["last_rotation_status"] = (result or "idle").strip().lower() or "idle"
+        current["last_rotation_reason"] = (reason or "").strip()
+        current["last_rotation_at"] = timestamp
+        current["last_rotation_at_iso"] = _format_runtime_timestamp(timestamp)
+        _PROXY_RUNTIME_STATUS[normalized_purpose] = current
+
+    snapshot = dict(current)
+    snapshot.pop("_proxy_url_raw", None)
+    snapshot.pop("_route_fingerprint", None)
+    return snapshot
+
+
+def mark_proxy_runtime_cooldown(
+    purpose: str,
+    reason: str,
+    *,
+    cooldown_seconds: float = _PROXY_RUNTIME_DEFAULT_COOLDOWN_SECONDS,
+    refresh_geo: bool = True,
+) -> Dict[str, Any]:
+    normalized_purpose = purpose if purpose in _PROXY_RUNTIME_PURPOSE_LABELS else "auth"
+    if refresh_geo:
+        refresh_proxy_runtime_status(normalized_purpose)
+
+    with _PROXY_RUNTIME_LOCK:
+        current = dict(_PROXY_RUNTIME_STATUS.get(normalized_purpose) or _new_proxy_runtime_status(normalized_purpose))
+
+    route_key = _build_runtime_route_key(current)
+    now = time.time()
+    until = now + max(30.0, float(cooldown_seconds or _PROXY_RUNTIME_DEFAULT_COOLDOWN_SECONDS))
+    payload = {
+        "route_key": route_key,
+        "reason": (reason or "").strip() or "unknown",
+        "until": until,
+        "created_at": now,
+    }
+
+    with _PROXY_RUNTIME_LOCK:
+        _cleanup_runtime_route_cooldowns(now)
+        _PROXY_RUNTIME_ROUTE_COOLDOWNS[route_key] = payload
+        current["cooldown_until"] = until
+        current["cooldown_until_iso"] = _format_runtime_timestamp(until)
+        current["cooldown_remaining_seconds"] = max(0, int(until - now))
+        current["cooldown_reason"] = payload["reason"]
+        current["error"] = payload["reason"]
+        _PROXY_RUNTIME_STATUS[normalized_purpose] = current
+
+    snapshot = dict(current)
+    snapshot.pop("_proxy_url_raw", None)
+    snapshot.pop("_route_fingerprint", None)
+    return snapshot
+
+
+def get_proxy_runtime_cooldown_status(
+    purpose: str,
+    *,
+    refresh_geo: bool = False,
+) -> Dict[str, Any]:
+    normalized_purpose = purpose if purpose in _PROXY_RUNTIME_PURPOSE_LABELS else "auth"
+    if refresh_geo:
+        refresh_proxy_runtime_status(normalized_purpose)
+
+    with _PROXY_RUNTIME_LOCK:
+        current = dict(_PROXY_RUNTIME_STATUS.get(normalized_purpose) or _new_proxy_runtime_status(normalized_purpose))
+
+    cooldown = _build_runtime_cooldown_payload(current)
+    return {
+        "active": bool(cooldown.get("cooldown_remaining_seconds")),
+        "route_key": _build_runtime_route_key(current),
+        "reason": cooldown.get("cooldown_reason") or "",
+        "remaining_seconds": int(cooldown.get("cooldown_remaining_seconds") or 0),
+        "until": float(cooldown.get("cooldown_until") or 0.0),
+        "geo": current.get("geo") or {},
+        "mode": current.get("mode") or "idle",
+    }
 
 
 @contextmanager
@@ -1079,15 +1567,37 @@ class ProxyTemplateAsyncClient:
 
     def _resolve_proxy_url(self) -> str:
         proxy_setting = (self._proxy_setting_supplier() or "").strip()
+        ctx = get_proxy_runtime_context()
+        account_id = ctx.get("account_id") or ctx.get("account") or self._default_account
+        email = ctx.get("email") or ""
+
         if not proxy_setting:
+            record_proxy_runtime_status(
+                "chat",
+                proxy_type="auto",
+                account_id=account_id,
+                email=email,
+                source="chat api",
+                note="当前未配置聊天代理，使用直连",
+                direct=True,
+            )
             return ""
 
-        ctx = get_proxy_runtime_context()
         proxy_url, _ = resolve_proxy_setting(
             proxy_setting,
-            account_id=ctx.get("account_id") or ctx.get("account") or "",
-            email=ctx.get("email") or "",
+            account_id=account_id,
+            email=email,
             extra=ctx,
+            default_account=self._default_account,
+        )
+        record_proxy_runtime_status(
+            "chat",
+            proxy_url=proxy_url,
+            proxy_type="auto",
+            account_id=account_id,
+            email=email,
+            source="chat api",
+            note="最近一次聊天/JWT 链路使用的代理",
             default_account=self._default_account,
         )
         return proxy_url

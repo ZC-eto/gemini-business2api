@@ -68,10 +68,16 @@ from core.account import (
 )
 from core.proxy_utils import (
     ProxyTemplateAsyncClient,
+    get_proxy_runtime_status_snapshot,
+    parse_resin_proxy_action,
     parse_proxy_setting,
     probe_browser_proxy_sync,
     probe_http_proxy_sync,
     proxy_runtime_context,
+    refresh_proxy_runtime_status,
+    resolve_proxy_setting,
+    rotate_resin_proxy_sync,
+    update_proxy_runtime_rotation_status,
 )
 
 # 导入 Uptime 追踪器
@@ -1808,6 +1814,14 @@ async def admin_test_proxy(request: Request, payload: ProxyTestRequest):
     result["mode"] = mode
     return result
 
+
+@app.get("/admin/settings/proxy-runtime")
+@require_login()
+async def admin_get_proxy_runtime(request: Request):
+    """获取当前最近一次真实使用到的代理运行态。"""
+    statuses = await asyncio.to_thread(get_proxy_runtime_status_snapshot, refresh_geo=True)
+    return {"statuses": statuses}
+
 @app.put("/admin/settings")
 @require_login()
 async def admin_update_settings(request: Request, new_settings: dict = Body(...)):
@@ -2271,6 +2285,156 @@ async def chat_impl(
             return "timeout"
         return "error"
 
+    def classify_chat_proxy_rotation(error: Exception) -> Dict[str, Any]:
+        status_code = error.status_code if isinstance(error, HTTPException) else None
+        if status_code == 429:
+            return {"should_rotate": False, "reason": "", "protect_account_on_403": False}
+        if status_code == 401:
+            return {"should_rotate": False, "reason": "", "protect_account_on_403": False}
+        if status_code == 403:
+            return {
+                "should_rotate": True,
+                "reason": "HTTP 403",
+                "protect_account_on_403": True,
+            }
+        if status_code == 504:
+            return {
+                "should_rotate": True,
+                "reason": "HTTP 504",
+                "protect_account_on_403": False,
+            }
+        if status_code == 502:
+            return {"should_rotate": False, "reason": "", "protect_account_on_403": False}
+        if isinstance(error, (asyncio.TimeoutError, httpx.TimeoutException)):
+            return {
+                "should_rotate": True,
+                "reason": type(error).__name__,
+                "protect_account_on_403": False,
+            }
+        if isinstance(error, ssl.SSLError):
+            return {
+                "should_rotate": True,
+                "reason": type(error).__name__,
+                "protect_account_on_403": False,
+            }
+        if isinstance(error, httpx.HTTPError):
+            return {
+                "should_rotate": True,
+                "reason": type(error).__name__,
+                "protect_account_on_403": False,
+            }
+        return {"should_rotate": False, "reason": "", "protect_account_on_403": False}
+
+    def resolve_chat_proxy_rotation_target(account_manager: AccountManager) -> Dict[str, Any]:
+        proxy_setting = (config.basic.proxy_for_chat or "").strip()
+        account_id = account_manager.config.account_id
+        email = account_manager.config.mail_address or account_id
+        if not proxy_setting:
+            return {
+                "mode": "direct",
+                "proxy_setting": proxy_setting,
+                "proxy_url": "",
+                "rotatable": False,
+                "account_id": account_id,
+                "email": email,
+                "reason": "当前聊天链路为直连模式，跳过 rotate",
+                "protect_account_on_403": False,
+            }
+
+        try:
+            proxy_url, _ = resolve_proxy_setting(
+                proxy_setting,
+                account_id=account_id,
+                email=email,
+                default_account="shared",
+            )
+        except Exception as exc:
+            return {
+                "mode": "invalid",
+                "proxy_setting": proxy_setting,
+                "proxy_url": "",
+                "rotatable": False,
+                "account_id": account_id,
+                "email": email,
+                "reason": f"聊天代理模板解析失败，无法 rotate: {exc}",
+                "protect_account_on_403": True,
+            }
+
+        resin = parse_resin_proxy_action(proxy_url)
+        if resin:
+            return {
+                "mode": "resin",
+                "proxy_setting": proxy_setting,
+                "proxy_url": proxy_url,
+                "rotatable": True,
+                "account_id": account_id,
+                "email": email,
+                "reason": "",
+                "protect_account_on_403": True,
+            }
+
+        return {
+            "mode": "standard",
+            "proxy_setting": proxy_setting,
+            "proxy_url": proxy_url,
+            "rotatable": False,
+            "account_id": account_id,
+            "email": email,
+            "reason": "当前聊天代理为标准代理，无法自动 rotate",
+            "protect_account_on_403": True,
+        }
+
+    async def try_rotate_chat_proxy_once(
+        account_manager: AccountManager,
+        request_id: str,
+        rotate_reason: str,
+    ) -> Dict[str, Any]:
+        capability = resolve_chat_proxy_rotation_target(account_manager)
+        account_id = account_manager.config.account_id
+
+        if not capability["rotatable"]:
+            reason = capability["reason"] or "当前聊天代理不支持自动 rotate"
+            update_proxy_runtime_rotation_status("chat", "skipped", reason)
+            if capability["mode"] == "direct":
+                logger.warning(f"[CHAT] [{account_id}] [req_{request_id}] ⚠️ {reason}")
+            else:
+                logger.warning(f"[CHAT] [{account_id}] [req_{request_id}] ⚠️ {reason}")
+            return {
+                "attempted": False,
+                "rotated": False,
+                "reason": reason,
+                "protect_account_on_403": bool(capability["protect_account_on_403"]),
+                "mode": capability["mode"],
+            }
+
+        logger.warning(
+            f"[CHAT] [{account_id}] [req_{request_id}] ♻️ 聊天请求命中代理切换条件: {rotate_reason}，准备请求 Resin 切换聊天代理"
+        )
+        rotated = await asyncio.to_thread(
+            rotate_resin_proxy_sync,
+            capability["proxy_setting"],
+            account_id=capability["account_id"],
+            email=capability["email"],
+            default_account="shared",
+            log_callback=lambda level, message: logger.warning(
+                f"[CHAT] [{account_id}] [req_{request_id}] {message}"
+            ),
+        )
+        rotation_note = (
+            f"{rotate_reason}，已请求聊天 Resin 切换代理并准备同账号重试"
+            if rotated
+            else f"{rotate_reason}，聊天 Resin rotate 失败，回退到切账号路径"
+        )
+        update_proxy_runtime_rotation_status("chat", "success" if rotated else "failed", rotation_note)
+        await asyncio.to_thread(refresh_proxy_runtime_status, "chat")
+        return {
+            "attempted": True,
+            "rotated": rotated,
+            "reason": rotation_note,
+            "protect_account_on_403": True,
+            "mode": capability["mode"],
+        }
+
 
     # 获取客户端IP（用于会话隔离）
     client_ip = request.headers.get("x-forwarded-for")
@@ -2442,6 +2606,7 @@ async def chat_impl(
         current_text = text_to_send
         current_retry_mode = is_retry_mode
         current_file_ids = []
+        chat_proxy_rotate_used = False
 
         for retry_idx in range(max_retries):
             try:
@@ -2515,15 +2680,50 @@ async def chat_impl(
                 # 判断请求类型以传递 quota_type
                 quota_type = get_request_quota_type(req.model)
 
-                # 使用统一的错误处理入口
-                # 注意：502 空响应错误不触发冷却，只切换账户重试
-                if is_http_exception:
-                    if status_code == 502:
+                chat_rotation_decision = classify_chat_proxy_rotation(e)
+                if chat_rotation_decision["should_rotate"] and not chat_proxy_rotate_used:
+                    rotate_result = await try_rotate_chat_proxy_once(
+                        account_manager,
+                        request_id,
+                        str(chat_rotation_decision["reason"] or error_detail),
+                    )
+                    chat_proxy_rotate_used = bool(rotate_result["attempted"])
+                    if rotate_result["rotated"]:
+                        logger.warning(
+                            f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] ♻️ 聊天代理已切换，保持当前账号重试一次"
+                        )
+                        continue
+                    if status_code == 403 and rotate_result["protect_account_on_403"]:
+                        logger.warning(
+                            f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] ⚠️ 当前 403 更像代理问题，但本轮无法完成聊天代理切换，回退为切账号重试（不立即禁用账号）"
+                        )
+                        account_manager.handle_non_http_error("聊天请求 403（代理疑似被风控）", request_id, quota_type)
+                    elif status_code == 403 and chat_proxy_rotate_used:
+                        logger.warning(
+                            f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] ❌ 聊天代理切换后同账号仍返回 403，改按账号问题处理"
+                        )
+                        account_manager.handle_http_error(status_code, str(e.detail) if hasattr(e, "detail") else "", request_id, quota_type)
+                    elif not is_http_exception:
+                        account_manager.handle_non_http_error("聊天请求", request_id, quota_type)
+                    elif status_code == 502:
                         logger.warning(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] 上游 502 错误，切换账户重试（不触发冷却）")
                     else:
-                        account_manager.handle_http_error(status_code, str(e.detail) if hasattr(e, 'detail') else "", request_id, quota_type)
+                        account_manager.handle_http_error(status_code, str(e.detail) if hasattr(e, "detail") else "", request_id, quota_type)
                 else:
-                    account_manager.handle_non_http_error("聊天请求", request_id, quota_type)
+                    if status_code == 403 and chat_proxy_rotate_used:
+                        logger.warning(
+                            f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] ❌ 聊天代理切换后同账号仍返回 403，改按账号问题处理"
+                        )
+
+                    # 使用统一的错误处理入口
+                    # 注意：502 空响应错误不触发冷却，只切换账户重试
+                    if is_http_exception:
+                        if status_code == 502:
+                            logger.warning(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] 上游 502 错误，切换账户重试（不触发冷却）")
+                        else:
+                            account_manager.handle_http_error(status_code, str(e.detail) if hasattr(e, 'detail') else "", request_id, quota_type)
+                    else:
+                        account_manager.handle_non_http_error("聊天请求", request_id, quota_type)
 
                 # 检查是否还能继续重试
                 if retry_idx < max_retries - 1:
