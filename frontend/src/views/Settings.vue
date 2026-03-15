@@ -210,18 +210,21 @@
             <div class="rounded-2xl border border-border bg-card p-4">
               <p class="text-xs uppercase tracking-[0.3em] text-muted-foreground">重试</p>
               <div class="mt-4 grid grid-cols-2 gap-3 text-sm">
-                <label class="col-span-2 text-xs text-muted-foreground">账户切换次数</label>
+                <div class="col-span-2 flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                  <span>账户切换次数</span>
+                  <HelpTip text="单个批量刷新任务在不同账号之间最多切换多少次。只有当前账号经过多轮验证码尝试仍失败后，才会切换到下一个账号。" />
+                </div>
                 <input v-model.number="localSettings.retry.max_account_switch_tries" type="number" min="1" class="col-span-2 rounded-2xl border border-input bg-background px-3 py-2" />
 
                 <div class="col-span-2 flex items-center justify-between gap-2 text-xs text-muted-foreground">
-                  <span>验证码最大尝试次数</span>
-                  <HelpTip text="单个账号获取验证码时的最大尝试次数。每次失败前会请求 Resin 切换一次账户操作代理；达到上限后才会换下一个账号。" />
+                  <span>单账号验证码尝试次数</span>
+                  <HelpTip text="单个账号最多尝试多少轮验证码流程。当前策略下，只要验证码等待失败，就会立刻结束本轮；若使用 Resin 账户代理，会先请求 rotate 再开始下一轮。" />
                 </div>
                 <input v-model.number="localSettings.retry.verification_code_attempts" type="number" min="1" max="10" class="col-span-2 rounded-2xl border border-input bg-background px-3 py-2" />
 
                 <div class="col-span-2 flex items-center justify-between gap-2 text-xs text-muted-foreground">
                   <span>验证码等待超时（秒）</span>
-                  <HelpTip text="单次等待验证码的总时长。超时后会按重发次数继续重发；如果整轮失败，会进入下一次验证码尝试并切换账户代理。" />
+                  <HelpTip text="单轮验证码等待的总时长。到达超时后，本轮会立刻判定失败；如果是 Resin 账户代理，会马上请求切换 IP 后再试下一轮。" />
                 </div>
                 <input v-model.number="localSettings.retry.verification_code_timeout_seconds" type="number" min="5" max="180" class="col-span-2 rounded-2xl border border-input bg-background px-3 py-2" />
 
@@ -254,6 +257,58 @@
           </div>
 
           <div class="space-y-4">
+            <div class="rounded-2xl border border-border bg-card p-4">
+              <div class="flex items-center justify-between gap-3">
+                <div>
+                  <p class="text-xs uppercase tracking-[0.3em] text-muted-foreground">当前代理状态</p>
+                  <p class="mt-2 text-xs text-muted-foreground">这里显示最近一次真实流量使用到的代理链路，不是静态配置预览。</p>
+                </div>
+                <button
+                  type="button"
+                  class="rounded-full border border-border px-3 py-1 text-xs font-medium text-muted-foreground transition-colors hover:border-primary hover:text-primary"
+                  @click="fetchProxyRuntime(true)"
+                >
+                  刷新状态
+                </button>
+              </div>
+              <div class="mt-4 space-y-3">
+                <div
+                  v-for="runtime in proxyRuntimeCards"
+                  :key="runtime.purpose"
+                  class="rounded-2xl border border-border bg-muted/20 px-4 py-3"
+                >
+                  <div class="flex items-start justify-between gap-3">
+                    <div>
+                      <p class="text-sm font-medium text-foreground">{{ runtime.label }}</p>
+                      <p class="mt-1 text-xs text-muted-foreground">{{ proxyRuntimeSummary(runtime) }}</p>
+                    </div>
+                    <span
+                      class="inline-flex items-center rounded-full border px-3 py-1 text-xs font-medium"
+                      :class="proxyRuntimeBadgeClass(runtime)"
+                    >
+                      {{ proxyRuntimeBadge(runtime) }}
+                    </span>
+                  </div>
+                  <div class="mt-3 space-y-1 text-xs text-muted-foreground">
+                    <p v-if="runtime.account_id">账号：{{ runtime.account_id }}</p>
+                    <p v-if="runtime.proxy_url">代理：{{ runtime.proxy_url }}</p>
+                    <p v-if="runtime.geo?.ip">
+                      出口 IP：{{ runtime.geo.ip }}
+                      <span v-if="formatRuntimeGeoLabel(runtime)">
+                        · {{ formatRuntimeGeoLabel(runtime) }}
+                      </span>
+                    </p>
+                    <p v-if="runtime.geo?.organization">线路：{{ runtime.geo.organization }}</p>
+                    <p v-if="runtime.resin">Resin：{{ runtime.resin.platform }} / {{ runtime.resin.account }}</p>
+                    <p v-if="runtime.note && runtime.mode !== 'idle'">{{ runtime.note }}</p>
+                    <p>更新时间：{{ formatRuntimeUpdatedAt(runtime.updated_at) }}</p>
+                    <p v-if="runtime.error">错误：{{ runtime.error }}</p>
+                    <p v-else-if="runtime.geo_error">位置探测：{{ runtime.geo_error }}</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
             <div class="rounded-2xl border border-border bg-card p-4">
               <p class="text-xs uppercase tracking-[0.3em] text-muted-foreground">自动注册/刷新</p>
               <div class="mt-4 space-y-3">
@@ -566,7 +621,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { settingsApi } from '@/api'
 import { useSettingsStore } from '@/stores/settings'
@@ -575,7 +630,7 @@ import { defaultMailProvider, mailProviderOptions } from '@/constants/mailProvid
 import SelectMenu from '@/components/ui/SelectMenu.vue'
 import Checkbox from '@/components/ui/Checkbox.vue'
 import HelpTip from '@/components/ui/HelpTip.vue'
-import type { ProxyTestResult, Settings } from '@/types/api'
+import type { ProxyRuntimePurpose, ProxyRuntimeStatus, ProxyTestResult, Settings } from '@/types/api'
 
 const settingsStore = useSettingsStore()
 const { settings, isLoading } = storeToRefs(settingsStore)
@@ -587,6 +642,24 @@ const errorMessage = ref('')
 const proxyModes = ['http', 'browser'] as const
 type ProxyMode = (typeof proxyModes)[number]
 type ProxyPurpose = 'auth' | 'chat'
+const proxyRuntimeState = ref<Record<ProxyRuntimePurpose, ProxyRuntimeStatus>>({
+  auth: {
+    purpose: 'auth',
+    label: '账户操作代理',
+    mode: 'idle',
+  },
+  mail: {
+    purpose: 'mail',
+    label: '临时邮箱代理',
+    mode: 'idle',
+  },
+  chat: {
+    purpose: 'chat',
+    label: '聊天操作代理',
+    mode: 'idle',
+  },
+})
+let proxyRuntimeTimer: ReturnType<typeof setInterval> | null = null
 
 const proxyTestState = ref<Record<ProxyPurpose, { loading: ProxyMode | null; results: Record<ProxyMode, ProxyTestResult | null> }>>({
   auth: {
@@ -706,6 +779,66 @@ const proxyTypeHint = (type: string | undefined, purpose: ProxyPurpose) => {
   return '自动检测会根据地址格式判断是否为 Resin；如果你明确知道当前代理类型，建议手动指定。'
 }
 
+const proxyRuntimeCards = computed(() => [
+  proxyRuntimeState.value.auth,
+  proxyRuntimeState.value.mail,
+  proxyRuntimeState.value.chat,
+])
+
+const proxyRuntimeBadge = (status: ProxyRuntimeStatus) => {
+  if (status.mode === 'proxy') return '代理中'
+  if (status.mode === 'direct') return '直连'
+  return '未使用'
+}
+
+const proxyRuntimeBadgeClass = (status: ProxyRuntimeStatus) => {
+  if (status.mode === 'proxy') return 'border-emerald-200 bg-emerald-50 text-emerald-900'
+  if (status.mode === 'direct') return 'border-sky-200 bg-sky-50 text-sky-900'
+  return 'border-border bg-muted/40 text-muted-foreground'
+}
+
+const formatRuntimeGeoLabel = (status: ProxyRuntimeStatus) =>
+  [status.geo?.country, status.geo?.region, status.geo?.city].filter(Boolean).join(' / ')
+
+const formatRuntimeUpdatedAt = (timestamp?: number) => {
+  if (!timestamp) return '未更新'
+  return new Date(timestamp * 1000).toLocaleString('zh-CN')
+}
+
+const proxyRuntimeSummary = (status: ProxyRuntimeStatus) => {
+  if (status.mode === 'proxy') {
+    return status.source || '最近一次实际流量已记录'
+  }
+  if (status.mode === 'direct') {
+    return status.note || '当前未通过代理，直接访问目标服务'
+  }
+  return status.note || '尚未产生实际流量'
+}
+
+const fetchProxyRuntime = async (showErrorToast = false) => {
+  try {
+    const response = await settingsApi.getProxyRuntime()
+    proxyRuntimeState.value = {
+      auth: response.statuses.auth || proxyRuntimeState.value.auth,
+      mail: response.statuses.mail || proxyRuntimeState.value.mail,
+      chat: response.statuses.chat || proxyRuntimeState.value.chat,
+    }
+  } catch (error: any) {
+    if (showErrorToast) {
+      toast.error(error?.message || '获取代理运行态失败')
+    }
+  }
+}
+
+const startProxyRuntimePolling = () => {
+  if (proxyRuntimeTimer) {
+    clearInterval(proxyRuntimeTimer)
+  }
+  proxyRuntimeTimer = setInterval(() => {
+    void fetchProxyRuntime(false)
+  }, 15000)
+}
+
 watch(settings, (value) => {
   if (!value) return
   const next = JSON.parse(JSON.stringify(value))
@@ -810,6 +943,15 @@ watch(settings, (value) => {
 
 onMounted(async () => {
   await settingsStore.loadSettings()
+  await fetchProxyRuntime(false)
+  startProxyRuntimePolling()
+})
+
+onBeforeUnmount(() => {
+  if (proxyRuntimeTimer) {
+    clearInterval(proxyRuntimeTimer)
+    proxyRuntimeTimer = null
+  }
 })
 
 const runProxyTest = async (purpose: ProxyPurpose, mode: ProxyMode) => {
@@ -836,6 +978,7 @@ const runProxyTest = async (purpose: ProxyPurpose, mode: ProxyMode) => {
       email: PROXY_TEST_EMAIL,
     })
     proxyTestState.value[purpose].results[mode] = result
+    await fetchProxyRuntime(false)
     if (result.success) {
       const ip = result.geo?.ip ? `，出口 ${result.geo.ip}` : ''
       toast.success(`${mode === 'http' ? 'HTTP' : '浏览器'}代理测试成功${ip}`)
@@ -871,6 +1014,7 @@ const handleSave = async () => {
         : 'normal'
     localSettings.value.basic.browser_headless = localSettings.value.basic.browser_mode === 'headless'
     await settingsStore.updateSettings(localSettings.value)
+    await fetchProxyRuntime(false)
     toast.success('设置保存成功')
   } catch (error: any) {
     errorMessage.value = error.message || '保存失败'

@@ -13,7 +13,15 @@ from core.config import config
 from core.mail_providers import create_temp_mail_client
 from core.gemini_automation import GeminiAutomation
 from core.microsoft_mail_client import MicrosoftMailClient
-from core.proxy_utils import resolve_proxy_setting, rotate_resin_proxy_sync
+from core.proxy_utils import (
+    get_proxy_runtime_cooldown_status,
+    mark_proxy_runtime_cooldown,
+    parse_resin_proxy_action,
+    record_proxy_runtime_status,
+    resolve_proxy_setting,
+    rotate_resin_proxy_sync,
+    update_proxy_runtime_rotation_status,
+)
 
 logger = logging.getLogger("gemini.login")
 
@@ -29,8 +37,20 @@ def _should_rotate_auth_proxy(error_message: str) -> bool:
         "send code failed",
         "verification code timeout",
         "verification code timeout after resend retries",
+        "verification code timeout after unknown send status",
     )
     return any(marker in error_text for marker in rotate_markers)
+
+
+def _auth_route_cooldown_seconds(error_message: str) -> float:
+    error_text = (error_message or "").strip().lower()
+    if "captcha_check_failed" in error_text:
+        return 600.0
+    if "send code failed" in error_text:
+        return 600.0
+    if "unknown send status" in error_text:
+        return 420.0
+    return 300.0
 
 
 @dataclass
@@ -309,19 +329,71 @@ class LoginService(BaseTaskService[LoginTask]):
 
         browser_mode = (config.basic.browser_mode or "normal").strip().lower()
         headless = config.basic.browser_headless
+        auth_proxy_type = (getattr(config.basic, "proxy_for_auth_type", "auto") or "auto").strip().lower()
 
         log_cb("info", f"🌐 启动浏览器 (模式={browser_mode}, 无头={headless})...")
 
         configured_auth_attempts = int(getattr(config.retry, "verification_code_attempts", 3) or 1)
         configured_auth_attempts = max(1, min(10, configured_auth_attempts))
         max_auth_attempts = configured_auth_attempts if proxy_source else 1
-        allow_resin_rotate = (getattr(config.basic, "proxy_for_auth_type", "auto") or "auto").strip().lower() != "standard"
+        auth_proxy_is_resin = bool(parse_resin_proxy_action(proxy_for_auth)) and auth_proxy_type != "standard"
+        record_proxy_runtime_status(
+            "auth",
+            proxy_url=proxy_for_auth,
+            proxy_type=auth_proxy_type,
+            account_id=account_id,
+            email=account_email,
+            source="refresh browser",
+            note="最近一次刷新/验证码链路使用的账户操作代理",
+            direct=not bool(proxy_for_auth),
+        )
+        if config.basic.mail_proxy_enabled:
+            record_proxy_runtime_status(
+                "mail",
+                proxy_url=proxy_for_auth,
+                proxy_type=auth_proxy_type,
+                account_id=account_id,
+                email=account_email,
+                source="temp mail polling",
+                note="最近一次临时邮箱拉取验证码使用的代理",
+                direct=not bool(proxy_for_auth),
+            )
+        else:
+            record_proxy_runtime_status(
+                "mail",
+                proxy_type=auth_proxy_type,
+                account_id=account_id,
+                email=account_email,
+                source="temp mail direct",
+                note="当前未启用邮箱代理，临时邮箱请求走直连",
+                direct=True,
+            )
+        allow_resin_rotate = auth_proxy_is_resin
         result = None
         for auth_attempt in range(1, max_auth_attempts + 1):
+            if allow_resin_rotate:
+                cooldown = get_proxy_runtime_cooldown_status("auth", refresh_geo=True)
+                if cooldown.get("active"):
+                    current_ip = (cooldown.get("geo") or {}).get("ip") or "unknown"
+                    log_cb(
+                        "warning",
+                        f"⚠️ 当前账户代理出口 {current_ip} 仍在冷却期 ({cooldown.get('remaining_seconds')}s, {cooldown.get('reason') or '未知原因'})，先请求 Resin 再切一次",
+                    )
+                    rotated = rotate_resin_proxy_sync(
+                        proxy_source,
+                        account_id=account_id,
+                        email=account_email,
+                        log_callback=log_cb,
+                    )
+                    if rotated:
+                        update_proxy_runtime_rotation_status("auth", "success", f"冷却命中: {cooldown.get('reason') or 'unknown'}")
+                    else:
+                        update_proxy_runtime_rotation_status("auth", "failed", f"冷却命中但 rotate 失败: {cooldown.get('reason') or 'unknown'}")
             automation = GeminiAutomation(
                 user_agent=self.user_agent,
                 proxy=proxy_for_auth,
                 browser_mode=browser_mode,
+                allow_inline_verification_resend=not auth_proxy_is_resin,
                 log_callback=log_cb,
             )
             # 允许外部取消时立刻关闭浏览器
@@ -337,16 +409,31 @@ class LoginService(BaseTaskService[LoginTask]):
                 break
 
             error = result.get("error", "自动化流程失败")
-            if auth_attempt < max_auth_attempts and allow_resin_rotate and _should_rotate_auth_proxy(error):
-                rotated = rotate_resin_proxy_sync(
-                    proxy_source,
-                    account_id=account_id,
-                    email=account_email,
-                    log_callback=log_cb,
+            if auth_attempt < max_auth_attempts and _should_rotate_auth_proxy(error):
+                mark_proxy_runtime_cooldown(
+                    "auth",
+                    error,
+                    cooldown_seconds=_auth_route_cooldown_seconds(error),
+                    refresh_geo=True,
                 )
-                if rotated:
-                    log_cb("warning", "♻️ 验证码链路疑似被风控，已请求 Resin 切换账户代理并重试")
+                if allow_resin_rotate:
+                    rotated = rotate_resin_proxy_sync(
+                        proxy_source,
+                        account_id=account_id,
+                        email=account_email,
+                        log_callback=log_cb,
+                    )
+                    if rotated:
+                        update_proxy_runtime_rotation_status("auth", "success", error)
+                        log_cb("warning", "♻️ 验证码链路首次失败，已立即请求 Resin 切换账户代理并重试")
+                        continue
+                    update_proxy_runtime_rotation_status("auth", "failed", error)
+                    log_cb("warning", "⚠️ 验证码链路失败，但 Resin rotate 未成功，继续使用当前代理重试")
                     continue
+
+                update_proxy_runtime_rotation_status("auth", "skipped", "当前不是 Resin 代理")
+                log_cb("warning", "⚠️ 验证码链路失败，当前不是 Resin 代理，将继续使用当前代理重试")
+                continue
 
             log_cb("error", f"❌ 自动登录失败: {error}")
             return {"success": False, "email": account_id, "error": error}

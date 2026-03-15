@@ -233,6 +233,69 @@
         </div>
       </div>
 
+      <div class="mt-4 grid gap-3 xl:grid-cols-3">
+        <div
+          v-for="runtime in proxyRuntimeCards"
+          :key="runtime.purpose"
+          class="rounded-2xl border border-border bg-muted/20 px-4 py-3"
+        >
+          <div class="flex items-start justify-between gap-3">
+            <div>
+              <p class="text-sm font-medium text-foreground">{{ runtime.label }}</p>
+              <p class="mt-1 text-xs text-muted-foreground">{{ proxyRuntimeSummary(runtime) }}</p>
+            </div>
+            <div class="flex flex-wrap items-center justify-end gap-2">
+              <span
+                class="inline-flex items-center rounded-full border px-3 py-1 text-[11px] font-medium"
+                :class="proxyRuntimeBadgeClass(runtime)"
+              >
+                {{ proxyRuntimeBadge(runtime) }}
+              </span>
+              <span class="inline-flex items-center rounded-full border border-border bg-background px-3 py-1 text-[11px] font-medium text-foreground">
+                {{ proxyRuntimeRouteLabel(runtime) }}
+              </span>
+            </div>
+          </div>
+
+          <div class="mt-3 grid gap-1 text-xs text-muted-foreground">
+            <p v-if="runtime.account_id">账号：{{ runtime.account_id }}</p>
+            <p v-if="runtime.proxy_url">代理：{{ runtime.proxy_url }}</p>
+            <p v-if="runtime.geo?.ip">
+              出口 IP：{{ runtime.geo.ip }}
+              <span v-if="formatRuntimeGeoLabel(runtime)">
+                · {{ formatRuntimeGeoLabel(runtime) }}
+              </span>
+            </p>
+            <p v-if="runtime.geo?.organization">线路：{{ runtime.geo.organization }}</p>
+            <p v-if="formatRuntimeLatency(runtime.latency_ms)">延迟：{{ formatRuntimeLatency(runtime.latency_ms) }}</p>
+            <p v-if="runtime.resin">Resin：{{ runtime.resin.platform }} / {{ runtime.resin.account }}</p>
+          </div>
+
+          <div class="mt-3 flex flex-wrap items-center gap-2 text-[11px]">
+            <span
+              class="inline-flex items-center rounded-full border px-3 py-1 font-medium"
+              :class="proxyRuntimeRotationClass(runtime)"
+            >
+              {{ proxyRuntimeRotationLabel(runtime) }}
+            </span>
+            <span
+              v-if="runtime.cooldown_remaining_seconds"
+              class="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-3 py-1 font-medium text-amber-900"
+            >
+              冷却 {{ formatRuntimeCooldown(runtime.cooldown_remaining_seconds) }}
+            </span>
+          </div>
+
+          <div class="mt-3 space-y-1 text-xs text-muted-foreground">
+            <p v-if="runtime.last_rotation_reason">切换说明：{{ runtime.last_rotation_reason }}</p>
+            <p v-if="runtime.cooldown_reason">冷却原因：{{ runtime.cooldown_reason }}</p>
+            <p v-if="runtime.error">错误：{{ runtime.error }}</p>
+            <p v-else-if="runtime.geo_error">位置探测：{{ runtime.geo_error }}</p>
+            <p>更新时间：{{ formatRuntimeUpdatedAt(runtime.updated_at) }}</p>
+          </div>
+        </div>
+      </div>
+
       <div v-if="viewMode === 'card'" class="mt-6 grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
         <div
           v-for="account in paginatedAccounts"
@@ -260,6 +323,7 @@
                 <span
                   class="inline-flex items-center rounded-full border border-border px-2 py-0.5 text-xs"
                   :class="statusClass(account)"
+                  :title="statusReason(account)"
                 >
                   {{ statusLabel(account) }}
                 </span>
@@ -350,7 +414,12 @@
                 <Checkbox :modelValue="allSelected" @update:modelValue="toggleSelectAll" />
               </th>
               <th class="py-3 pr-6">账号 ID</th>
-              <th class="py-3 pr-6">状态</th>
+              <th class="py-3 pr-6">
+                <span class="inline-flex items-center gap-2">
+                  状态
+                  <HelpTip text="403 禁用表示目标服务返回了 HTTP 403，当前账号被 Gemini/Google 拒绝访问或已触发限制，系统已自动禁用该账号。" />
+                </span>
+              </th>
               <th class="py-3 pr-6">
                 <span class="inline-flex items-center gap-2">
                   剩余/过期
@@ -390,6 +459,7 @@
                   <span
                     class="inline-flex items-center rounded-full border border-border px-3 py-1 text-xs"
                     :class="statusClass(account)"
+                    :title="statusReason(account)"
                   >
                     {{ statusLabel(account) }}
                   </span>
@@ -754,18 +824,29 @@
               <p class="text-[11px] text-muted-foreground">
                 {{ taskLogMode === 'summary' ? '摘要模式仅保留关键事件（开始、结束、失败、告警）。' : '详情模式显示全部日志。' }}
               </p>
-              <button
-                type="button"
-                class="rounded-full px-3 py-1 text-xs font-medium transition-colors"
-                :class="taskLogMode === 'summary' ? 'bg-primary text-primary-foreground' : 'border border-border text-muted-foreground hover:text-foreground'"
-                @click="toggleTaskLogMode"
-              >
-                {{ taskLogMode === 'summary' ? '摘要模式' : '详情模式' }}
-              </button>
+              <div class="flex items-center gap-2">
+                <button
+                  v-if="!taskLogsAutoFollow"
+                  type="button"
+                  class="rounded-full border border-border px-3 py-1 text-xs font-medium text-muted-foreground transition-colors hover:border-primary hover:text-primary"
+                  @click="jumpTaskLogsToBottom"
+                >
+                  回到底部
+                </button>
+                <button
+                  type="button"
+                  class="rounded-full px-3 py-1 text-xs font-medium transition-colors"
+                  :class="taskLogMode === 'summary' ? 'bg-primary text-primary-foreground' : 'border border-border text-muted-foreground hover:text-foreground'"
+                  @click="toggleTaskLogMode"
+                >
+                  {{ taskLogMode === 'summary' ? '摘要模式' : '详情模式' }}
+                </button>
+              </div>
             </div>
             <div
               ref="taskLogsRef"
               class="scrollbar-slim flex-1 overflow-y-auto rounded-2xl border border-border bg-muted/30 p-3"
+              @scroll="handleTaskLogsScroll"
             >
               <div v-if="visibleRegisterLogs.length" class="space-y-2">
                 <p class="text-xs font-semibold text-foreground">注册日志</p>
@@ -862,20 +943,6 @@
                     </div>
 
                     <div class="space-y-2">
-                      <label class="block text-xs text-muted-foreground">验证码重发次数</label>
-                      <input
-                        v-model.number="verificationCodeResendCount"
-                        type="number"
-                        min="0"
-                        max="5"
-                        class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
-                      />
-                      <p class="text-xs text-muted-foreground">
-                        验证码首次等待超时后，额外尝试重发的次数（默认 2，0 表示不重发）
-                      </p>
-                    </div>
-
-                    <div class="space-y-2">
                       <label class="block text-xs text-muted-foreground">过期刷新窗口（小时）</label>
                       <input
                         v-model.number="refreshWindowHours"
@@ -887,6 +954,10 @@
                       <p class="text-xs text-muted-foreground">
                         当账号距离过期小于等于该值时，会触发自动刷新
                       </p>
+                    </div>
+
+                    <div class="rounded-2xl border border-border bg-muted/20 px-4 py-3 text-xs text-muted-foreground">
+                      验证码等待时长、轮询间隔、单账号尝试次数等策略，统一在“系统设置 → 重试”中配置。这里不再单独维护验证码重发参数，避免和全局设置冲突。
                     </div>
 
                     <div class="space-y-3 rounded-2xl border border-border bg-muted/20 px-4 py-3">
@@ -1269,7 +1340,7 @@ import { useToast } from '@/composables/useToast'
 import HelpTip from '@/components/ui/HelpTip.vue'
 import { accountsApi, settingsApi } from '@/api'
 import { mailProviderOptions, defaultMailProvider } from '@/constants/mailProviders'
-import type { AdminAccount, AccountConfigItem, RegisterTask, LoginTask } from '@/types/api'
+import type { AdminAccount, AccountConfigItem, RegisterTask, LoginTask, ProxyRuntimePurpose, ProxyRuntimeStatus } from '@/types/api'
 
 const accountsStore = useAccountsStore()
 const { accounts, isLoading, isOperating, batchProgress } = storeToRefs(accountsStore)
@@ -1313,7 +1384,6 @@ const lastLoginTaskId = ref<string | null>(null)
 const scheduledRefreshEnabled = ref(false)
 const scheduledRefreshCron = ref('08:00,20:00')
 const refreshCooldownHours = ref(12)
-const verificationCodeResendCount = ref(2)
 const refreshWindowHours = ref(24)
 const browserMode = ref<'normal' | 'silent' | 'headless'>('normal')
 const isLoadingScheduledConfig = ref(false)
@@ -1329,6 +1399,24 @@ const loginTask = ref<LoginTask | null>(null)
 const refreshingAccountIds = ref<Set<string>>(new Set())  // 正在刷新的账户ID集合（仅用于显示状态）
 const queuedRefreshAccountIds = ref<Set<string>>(new Set())  // 刷新任务中尚未处理的账户ID集合（仅用于显示状态）
 const taskLogsRef = ref<HTMLDivElement | null>(null)
+const taskLogsAutoFollow = ref(true)
+const proxyRuntimeState = ref<Record<ProxyRuntimePurpose, ProxyRuntimeStatus>>({
+  auth: {
+    purpose: 'auth',
+    label: '账户操作链路',
+    mode: 'idle',
+  },
+  mail: {
+    purpose: 'mail',
+    label: '临时邮箱链路',
+    mode: 'idle',
+  },
+  chat: {
+    purpose: 'chat',
+    label: '聊天链路',
+    mode: 'idle',
+  },
+})
 const isRegistering = ref(false)
 const isRefreshing = ref(false)
 const automationError = ref('')
@@ -1361,6 +1449,105 @@ const statusOptions = [
   { label: '403 禁用', value: '403 禁用' },
   { label: '429限流', value: '429限流' },
 ]
+
+const proxyRuntimeCards = computed(() => [
+  proxyRuntimeState.value.auth,
+  proxyRuntimeState.value.mail,
+  proxyRuntimeState.value.chat,
+])
+
+const proxyRuntimeBadge = (status: ProxyRuntimeStatus) => {
+  if (status.mode === 'proxy') return '代理中'
+  if (status.mode === 'direct') return '直连'
+  return '未使用'
+}
+
+const proxyRuntimeBadgeClass = (status: ProxyRuntimeStatus) => {
+  if (status.mode === 'proxy') return 'border-emerald-200 bg-emerald-50 text-emerald-900'
+  if (status.mode === 'direct') return 'border-sky-200 bg-sky-50 text-sky-900'
+  return 'border-border bg-muted/40 text-muted-foreground'
+}
+
+const proxyRuntimeRouteLabel = (status: ProxyRuntimeStatus) => {
+  if (status.mode_label) return status.mode_label
+  if (status.mode === 'direct') return '直连'
+  if (status.route_kind === 'resin') return 'Resin 代理'
+  if (status.route_kind === 'socks') return 'SOCKS 代理'
+  if (status.route_kind === 'http') return 'HTTP 代理'
+  if (status.mode === 'proxy') return '代理'
+  return '未使用'
+}
+
+const proxyRuntimeRotationLabel = (status: ProxyRuntimeStatus) => {
+  const value = (status.last_rotation_status || 'idle').toLowerCase()
+  if (value === 'success') return '已切换'
+  if (value === 'failed') return '切换失败'
+  if (value === 'skipped') return '未切换'
+  return '未切换'
+}
+
+const proxyRuntimeRotationClass = (status: ProxyRuntimeStatus) => {
+  const value = (status.last_rotation_status || 'idle').toLowerCase()
+  if (value === 'success') return 'border-emerald-200 bg-emerald-50 text-emerald-900'
+  if (value === 'failed') return 'border-rose-200 bg-rose-50 text-rose-900'
+  return 'border-border bg-muted/40 text-muted-foreground'
+}
+
+const formatRuntimeGeoLabel = (status: ProxyRuntimeStatus) =>
+  [status.geo?.country, status.geo?.region, status.geo?.city].filter(Boolean).join(' / ')
+
+const formatRuntimeUpdatedAt = (timestamp?: number) => {
+  if (!timestamp) return '未更新'
+  return new Date(timestamp * 1000).toLocaleString('zh-CN')
+}
+
+const formatRuntimeCooldown = (seconds?: number) => {
+  const remaining = Math.max(0, Number(seconds || 0))
+  if (!remaining) return ''
+  if (remaining >= 3600) return `${(remaining / 3600).toFixed(1)}h`
+  if (remaining >= 60) return `${Math.ceil(remaining / 60)}m`
+  return `${remaining}s`
+}
+
+const formatRuntimeLatency = (latency?: number | null) => {
+  if (!Number.isFinite(latency ?? NaN)) return ''
+  return `${latency} ms`
+}
+
+const proxyRuntimeSummary = (status: ProxyRuntimeStatus) => {
+  if (status.cooldown_remaining_seconds) {
+    return `当前出口处于冷却期，剩余 ${formatRuntimeCooldown(status.cooldown_remaining_seconds)}`
+  }
+  if (status.mode === 'proxy') {
+    return status.source || '最近一次真实流量已记录'
+  }
+  if (status.mode === 'direct') {
+    return status.note || '当前未通过代理，直接访问目标服务'
+  }
+  return status.note || '尚未产生实际流量'
+}
+
+const fetchProxyRuntime = async (showErrorToast = false) => {
+  try {
+    const response = await settingsApi.getProxyRuntime()
+    proxyRuntimeState.value = {
+      auth: response.statuses.auth || proxyRuntimeState.value.auth,
+      mail: response.statuses.mail || proxyRuntimeState.value.mail,
+      chat: response.statuses.chat || proxyRuntimeState.value.chat,
+    }
+  } catch (error: any) {
+    if (showErrorToast) {
+      toast.error(error?.message || '获取代理运行态失败')
+    }
+  }
+}
+
+const startProxyRuntimePolling = () => {
+  clearProxyRuntimeTimer()
+  proxyRuntimeTimer = window.setInterval(() => {
+    void fetchProxyRuntime(false)
+  }, 10000)
+}
 
 const filteredAccounts = computed(() => {
   const query = searchQuery.value.trim().toLowerCase()
@@ -2114,7 +2301,6 @@ const loadScheduledConfig = async () => {
     scheduledRefreshEnabled.value = settings.retry.scheduled_refresh_enabled ?? false
     scheduledRefreshCron.value = settings.retry.scheduled_refresh_cron ?? '08:00,20:00'
     refreshCooldownHours.value = settings.retry.refresh_cooldown_hours ?? 12
-    verificationCodeResendCount.value = settings.retry.verification_code_resend_count ?? 2
     refreshWindowHours.value = settings.basic.refresh_window_hours ?? 24
     browserMode.value =
       settings.basic.browser_mode === 'normal' ||
@@ -2178,16 +2364,6 @@ const saveScheduledConfig = async () => {
     return
   }
 
-  // 验证验证码重发次数
-  if (isNaN(verificationCodeResendCount.value) || !Number.isInteger(verificationCodeResendCount.value)) {
-    toast.error('验证码重发次数必须是有效的整数')
-    return
-  }
-  if (verificationCodeResendCount.value < 0 || verificationCodeResendCount.value > 5) {
-    toast.error('验证码重发次数必须在 0-5 之间')
-    return
-  }
-
   // 验证过期刷新窗口
   if (isNaN(refreshWindowHours.value) || !Number.isInteger(refreshWindowHours.value)) {
     toast.error('过期刷新窗口必须是有效的整数')
@@ -2210,7 +2386,6 @@ const saveScheduledConfig = async () => {
     settings.retry.scheduled_refresh_enabled = scheduledRefreshEnabled.value
     settings.retry.scheduled_refresh_cron = normalizedCron
     settings.retry.refresh_cooldown_hours = refreshCooldownHours.value
-    settings.retry.verification_code_resend_count = verificationCodeResendCount.value
     settings.basic.refresh_window_hours = refreshWindowHours.value
     settings.basic.browser_mode = browserMode.value
     settings.basic.browser_headless = browserMode.value === 'headless'
@@ -2387,7 +2562,9 @@ onMounted(async () => {
   hydrateTaskCache()
   await refreshAccounts()
   await loadCurrentTasks()
+  await fetchProxyRuntime(false)
   startBackgroundTaskPolling()
+  startProxyRuntimePolling()
   document.addEventListener('click', handleMoreActionsClick)
 })
 
@@ -2401,17 +2578,39 @@ const loginLogs = computed(() => {
 })
 const visibleRegisterLogs = computed(() => buildVisibleTaskLogs(registerLogs.value))
 const visibleLoginLogs = computed(() => buildVisibleTaskLogs(loginLogs.value))
-const scrollTaskLogsToBottom = async () => {
+const taskLogsDistanceToBottom = (container: HTMLDivElement) =>
+  container.scrollHeight - (container.scrollTop + container.clientHeight)
+
+const handleTaskLogsScroll = () => {
+  const container = taskLogsRef.value
+  if (!container) return
+  taskLogsAutoFollow.value = taskLogsDistanceToBottom(container) <= 40
+}
+
+const scrollTaskLogsToBottom = async (force = false) => {
   await nextTick()
   const container = taskLogsRef.value
   if (!container) return
+  if (!force && !taskLogsAutoFollow.value) return
   container.scrollTop = container.scrollHeight
+  taskLogsAutoFollow.value = true
 }
 
 watch([visibleRegisterLogs, visibleLoginLogs, isTaskOpen, taskLogMode], async () => {
   if (!isTaskOpen.value) return
   await scrollTaskLogsToBottom()
 }, { deep: true })
+
+watch([isTaskOpen, activeTaskTab], async ([open, tab]) => {
+  if (!open || tab !== 'current') return
+  taskLogsAutoFollow.value = true
+  await scrollTaskLogsToBottom(true)
+})
+
+const jumpTaskLogsToBottom = async () => {
+  taskLogsAutoFollow.value = true
+  await scrollTaskLogsToBottom(true)
+}
 const isTaskRunning = computed(() => {
   const registerStatus = registerTask.value?.status
   const loginStatus = loginTask.value?.status
@@ -2443,6 +2642,7 @@ onBeforeUnmount(() => {
   clearRegisterTimer()
   clearLoginTimer()
   clearBackgroundTaskTimer()
+  clearProxyRuntimeTimer()
   document.removeEventListener('click', handleMoreActionsClick)
 })
 
@@ -2470,6 +2670,23 @@ const statusLabel = (account: AdminAccount) => {
     return '即将过期'
   }
   return '正常'
+}
+
+const statusReason = (account: AdminAccount) => {
+  const status = statusLabel(account)
+  if (status === '403 禁用') {
+    return '目标服务返回了 HTTP 403，说明当前账号被 Gemini/Google 拒绝访问或触发了限制，系统已自动禁用该账号。'
+  }
+  if (status === '429限流') {
+    return '该账号当前触发了配额/频率限制，冷却结束后会自动恢复。'
+  }
+  if (status === '已过期') {
+    return '账号 Cookie 或会话已过期，需要重新刷新。'
+  }
+  if (status === '手动禁用') {
+    return '该账号是手动禁用状态，不会参与调度。'
+  }
+  return ''
 }
 
 const statusClass = (account: AdminAccount) => {
@@ -2822,6 +3039,7 @@ const handleDelete = async (accountId: string) => {
 let registerTimer: number | null = null
 let loginTimer: number | null = null
 let backgroundTaskTimer: number | null = null
+let proxyRuntimeTimer: number | null = null
 let backgroundTaskPending = false
 
 const clearRegisterTimer = () => {
@@ -2844,6 +3062,13 @@ const clearBackgroundTaskTimer = () => {
     backgroundTaskTimer = null
   }
   backgroundTaskPending = false
+}
+
+const clearProxyRuntimeTimer = () => {
+  if (proxyRuntimeTimer !== null) {
+    window.clearInterval(proxyRuntimeTimer)
+    proxyRuntimeTimer = null
+  }
 }
 
 const getTaskResultType = (

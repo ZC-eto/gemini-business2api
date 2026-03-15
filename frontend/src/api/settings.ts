@@ -1,5 +1,5 @@
 import apiClient from './client'
-import type { ProxyTestRequest, ProxyTestResult, Settings } from '@/types/api'
+import type { ProxyRuntimeResponse, ProxyTestRequest, ProxyTestResult, Settings } from '@/types/api'
 
 export const settingsApi = {
   // 获取设置
@@ -12,4 +12,7 @@ export const settingsApi = {
 
   testProxy: (payload: ProxyTestRequest) =>
     apiClient.post<ProxyTestRequest, ProxyTestResult>('/admin/settings/proxy-test', payload),
+
+  getProxyRuntime: () =>
+    apiClient.get<never, ProxyRuntimeResponse>('/admin/settings/proxy-runtime'),
 }

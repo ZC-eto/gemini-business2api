@@ -192,6 +192,42 @@ export interface ProxyTestResult {
   resin?: ResinProxyInfo | null
 }
 
+export type ProxyRuntimePurpose = 'auth' | 'mail' | 'chat'
+
+export interface ProxyRuntimeStatus {
+  purpose: ProxyRuntimePurpose
+  label: string
+  mode: 'idle' | 'direct' | 'proxy'
+  mode_label?: string
+  route_kind?: 'idle' | 'direct' | 'resin' | 'http' | 'socks' | 'proxy'
+  source?: string
+  note?: string
+  proxy_type?: 'auto' | 'standard' | 'resin'
+  proxy_url?: string
+  no_proxy?: string
+  account_id?: string
+  email?: string
+  geo?: ProxyGeoInfo
+  latency_ms?: number | null
+  resin?: ResinProxyInfo | null
+  last_rotation_status?: 'idle' | 'success' | 'failed' | 'skipped' | string
+  last_rotation_reason?: string
+  last_rotation_at?: number
+  last_rotation_at_iso?: string
+  cooldown_until?: number
+  cooldown_until_iso?: string
+  cooldown_remaining_seconds?: number
+  cooldown_reason?: string
+  updated_at?: number
+  updated_at_iso?: string
+  error?: string
+  geo_error?: string
+}
+
+export interface ProxyRuntimeResponse {
+  statuses: Record<ProxyRuntimePurpose, ProxyRuntimeStatus>
+}
+
 export interface LogEntry {
   time: string
   level: 'INFO' | 'WARNING' | 'ERROR' | 'CRITICAL' | 'DEBUG'

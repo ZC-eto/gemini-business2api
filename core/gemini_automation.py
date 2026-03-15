@@ -57,6 +57,7 @@ class GeminiAutomation:
         headless: bool = True,
         browser_mode: str = "",
         timeout: int = 60,
+        allow_inline_verification_resend: bool = True,
         log_callback=None,
     ) -> None:
         self.user_agent = user_agent or self._get_ua()
@@ -65,6 +66,7 @@ class GeminiAutomation:
         self.browser_mode = _normalize_browser_mode(browser_mode, default_mode)
         self.headless = self.browser_mode == BROWSER_MODE_HEADLESS
         self.timeout = timeout
+        self.allow_inline_verification_resend = allow_inline_verification_resend
         self.log_callback = log_callback
         self._page = None
         self._user_data_dir = None
@@ -311,6 +313,11 @@ class GeminiAutomation:
             send_round += 1
             if self._click_send_code_button(page):
                 break
+            if self._last_send_confidence == "failed":
+                send_error = self._last_send_error or "send code failed"
+                self._log("error", f"❌ 验证码发送状态明确失败 ({send_error})，结束当前轮次并交给上层切换代理")
+                self._save_screenshot(page, "send_code_failed")
+                return {"success": False, "error": f"send code failed: {send_error}"}
             if send_round >= max_send_rounds:
                 self._log("error", "❌ 验证码发送失败（可能触发风控），建议更换代理IP")
                 self._save_screenshot(page, "send_code_button_failed")
@@ -335,15 +342,35 @@ class GeminiAutomation:
         verification_timeout = max(5, min(180, verification_timeout))
         poll_interval = int(getattr(config.retry, "verification_code_poll_interval_seconds", 5) or 5)
         poll_interval = max(1, min(30, poll_interval))
+        if self._last_send_confidence == "failed":
+            send_error = self._last_send_error or "send code failed"
+            self._log("warning", f"⚠️ 验证码发送状态明确失败 ({send_error})，跳过邮箱轮询，交给上层切换代理后重试")
+            self._save_screenshot(page, "send_code_failed_before_poll")
+            return {"success": False, "error": f"send code failed: {send_error}"}
+        effective_timeout = verification_timeout
+        if self._last_send_confidence == "unknown":
+            self._log(
+                "warning",
+                f"⚠️ 验证码发送状态未确认，将按完整一轮继续观察 ({effective_timeout}s / 每 {poll_interval}s 轮询)；若这一轮仍无验证码，将交给上层切换代理",
+            )
         self._log(
             "info",
-            f"📬 等待邮箱验证码 (窗口 {verification_timeout}s, 轮询 {poll_interval}s, 发送状态={self._last_send_confidence})",
+            f"📬 等待邮箱验证码 (窗口 {effective_timeout}s, 轮询 {poll_interval}s, 发送状态={self._last_send_confidence})",
         )
-        code = mail_client.poll_for_code(timeout=verification_timeout, interval=poll_interval, since_time=poll_since_time)
+        code = mail_client.poll_for_code(timeout=effective_timeout, interval=poll_interval, since_time=poll_since_time)
 
         if not code:
             resend_attempts = int(getattr(config.retry, "verification_code_resend_count", 2) or 0)
             resend_attempts = max(0, min(5, resend_attempts))
+            if self._last_send_confidence == "unknown":
+                self._log("warning", "⚠️ 验证码发送状态始终未确认，完整等待一轮后仍未收到验证码，结束本轮并交给上层重试")
+                self._save_screenshot(page, "code_timeout_after_unknown_send")
+                return {"success": False, "error": "verification code timeout after unknown send status"}
+            if not self.allow_inline_verification_resend:
+                self._log("warning", "⚠️ 验证码等待失败，当前策略会立即结束本轮并交给上层切换代理后重试")
+                self._save_screenshot(page, "code_timeout_need_rotate")
+                return {"success": False, "error": "verification code timeout"}
+
             if resend_attempts <= 0:
                 self._log("error", "❌ 验证码超时且未启用重发")
                 self._save_screenshot(page, "code_timeout")
@@ -354,6 +381,11 @@ class GeminiAutomation:
                 time.sleep(random.uniform(1.0, 2.0))
 
                 if not self._click_resend_code_button(page):
+                    if self._last_send_confidence == "failed":
+                        send_error = self._last_send_error or "send code failed"
+                        self._log("error", f"❌ 重新发送验证码明确失败 ({send_error})，结束本轮并交给上层重试")
+                        self._save_screenshot(page, "resend_code_failed")
+                        return {"success": False, "error": f"send code failed: {send_error}"}
                     self._log("warning", f"⚠️ 未找到重发按钮 ({resend_index}/{resend_attempts})")
                     continue
 
@@ -498,6 +530,13 @@ class GeminiAutomation:
                     if self._evaluate_send_after_click(page):
                         self._stop_listen(page)
                         return True
+                    if self._last_send_confidence == "failed":
+                        if self._last_send_error == "captcha_check_failed":
+                            self._log("error", f"❌ 触发风控，发送验证码明确失败 ({attempt}/{max_send_attempts})")
+                        else:
+                            self._log("error", f"❌ 验证码发送明确失败 ({attempt}/{max_send_attempts})")
+                        self._stop_listen(page)
+                        return False
                     delay = retry_delays[min(attempt - 1, len(retry_delays) - 1)]
                     if self._last_send_error == "captcha_check_failed":
                         self._log("error", f"❌ 触发风控，建议更换代理IP ({attempt}/{max_send_attempts})")
@@ -523,6 +562,13 @@ class GeminiAutomation:
                             if self._evaluate_send_after_click(page):
                                 self._stop_listen(page)
                                 return True
+                            if self._last_send_confidence == "failed":
+                                if self._last_send_error == "captcha_check_failed":
+                                    self._log("error", f"❌ 触发风控，发送验证码明确失败 ({attempt}/{max_send_attempts})")
+                                else:
+                                    self._log("error", f"❌ 验证码发送明确失败 ({attempt}/{max_send_attempts})")
+                                self._stop_listen(page)
+                                return False
                             delay = retry_delays[min(attempt - 1, len(retry_delays) - 1)]
                             if self._last_send_error == "captcha_check_failed":
                                 self._log("error", f"❌ 触发风控，建议更换代理IP ({attempt}/{max_send_attempts})")
@@ -553,6 +599,9 @@ class GeminiAutomation:
                 self._log("info", "✅ 已点击重新发送按钮")
                 return True
             else:
+                if self._last_send_confidence == "failed":
+                    self._log("error", "❌ 已在验证码输入页面，但重新发送验证码明确失败")
+                    return False
                 self._log("warning", "⚠️ 未找到重新发送按钮，继续流程")
                 return True
 
@@ -572,13 +621,16 @@ class GeminiAutomation:
         """Evaluate send-code click result with network/UI fallback."""
         network_ok = self._verify_code_send_by_network(page)
         ui_state = self._verify_code_send_status(page)
-        if self._last_send_error or ui_state is False:
+        code_input = page.ele("css:input[jsname='ovqh0b']", timeout=2) or page.ele("css:input[name='pinInput']", timeout=1)
+        if self._last_send_error:
             self._last_send_confidence = "failed"
             return False
         if network_ok or ui_state is True:
             self._last_send_confidence = "confirmed"
             return True
-        code_input = page.ele("css:input[jsname='ovqh0b']", timeout=2) or page.ele("css:input[name='pinInput']", timeout=1)
+        if ui_state is False and not code_input:
+            self._last_send_confidence = "failed"
+            return False
         if code_input:
             self._last_send_confidence = "unknown"
             return True
@@ -667,13 +719,17 @@ class GeminiAutomation:
         try:
             success_keywords = ["验证码已发送", "code sent", "email sent", "check your email", "已发送"]
             error_keywords = [
-                "出了点问题",
-                "something went wrong",
-                "error",
-                "failed",
-                "try again",
+                "验证码发送失败",
+                "无法发送验证码",
+                "无法通过电子邮件发送验证码",
+                "send code failed",
+                "couldn't send a code",
+                "could not send a code",
+                "failed to send code",
+                "failed to send verification code",
+                "captcha check failed",
                 "稍后再试",
-                "选择其他登录方法"
+                "please try again later",
             ]
             selectors = [
                 "css:.zyTWof-gIZMF",
@@ -858,12 +914,17 @@ class GeminiAutomation:
                         self._human_click(page, btn)
                         network_ok = self._verify_code_send_by_network(page)
                         ui_state = self._verify_code_send_status(page)
-                        if self._last_send_error or ui_state is False:
+                        code_input = page.ele("css:input[jsname='ovqh0b']", timeout=2) or page.ele("css:input[name='pinInput']", timeout=1)
+                        if self._last_send_error:
                             self._last_send_confidence = "failed"
                             self._stop_listen(page)
                             return False
                         if network_ok or ui_state is True:
                             self._last_send_confidence = "confirmed"
+                        elif ui_state is False and not code_input:
+                            self._last_send_confidence = "failed"
+                            self._stop_listen(page)
+                            return False
                         else:
                             self._last_send_confidence = "unknown"
                         self._stop_listen(page)
@@ -873,7 +934,7 @@ class GeminiAutomation:
         except Exception:
             pass
 
-        self._last_send_confidence = "failed"
+        self._last_send_confidence = "unknown"
         self._stop_listen(page)
         return False
 
